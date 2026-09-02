@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CloudVitals | Cost + Health Dashboard</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="pulse"></div>
+      <div>
+        <h1>Ops Agent</h1>
+        <p>Cost anomaly → resource health drilldown</p>
+      </div>
+    </div>
+    <div class="toolbar">
+      <label for="runSelect">Run</label>
+      <select id="runSelect"></select>
+      <button id="refreshBtn">Refresh</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero-panel">
+      <div>
+        <p class="eyebrow">FinOps + Observability</p>
+        <h2>Understand cost anomalies. Investigate resource health.</h2>
+        <p class="muted">Ops Agent analyzes cloud resource costs to identify meaningful trends, deviations, spikes, drops, volatility, and anomalies. It then connects significant cost events with health signals from the affected resource to help determine whether unusual spending is associated with an underlying resource-health condition.</p>
+        <p class="muted hero-instruction">Start with the overall cost picture, select a resource to inspect its individual cost trend, and click a cost anomaly point to drill into health signals for that resource and day.</p>
+      </div>
+      <div id="runMeta" class="run-meta"></div>
+    </section>
+
+    <section id="summaryCards" class="summary-grid"></section>
+
+    <section class="dashboard-grid">
+      <aside class="resource-panel card">
+        <div class="section-head">
+          <div>
+            <h3>Affected resources</h3>
+            <p id="resourceCount" class="muted"></p>
+          </div>
+        </div>
+        <input id="resourceSearch" class="search" placeholder="Search resource, type, severity…" />
+        <div class="filters">
+          <button class="chip active" data-severity="all">All</button>
+          <button class="chip" data-severity="Critical">Critical</button>
+          <button class="chip" data-severity="High">High</button>
+          <button class="chip" data-severity="Medium">Medium</button>
+          <button class="chip" data-severity="Low">Low</button>
+        </div>
+        <div id="resourceList" class="resource-list"></div>
+      </aside>
+
+      <section class="chart-stack">
+        <div class="card chart-card">
+          <div class="section-head">
+            <div>
+              <h3 id="costChartTitle">Overall cost trend</h3>
+              <p id="costChartSubtitle" class="muted mono">All analyzed resources</p>
+            </div>
+            <div class="chart-actions">
+              <button id="overallBtn" class="chip hidden" type="button">← Overall</button>
+              <div id="costLegend" class="legend"></div>
+            </div>
+          </div>
+          <div id="costChart" class="chart"></div>
+          <div id="costPointDetail" class="detail-bar"></div>
+        </div>
+
+        <div class="card chart-card">
+          <div class="section-head">
+            <div>
+              <h3>Hourly health drilldown</h3>
+              <p id="healthContext" class="muted">Health drilldown will appear after selecting a resource-level cost point.</p>
+            </div>
+            <div class="toggle-group">
+              <button id="rawMode" class="chip active">Raw</button>
+              <button id="normalizedMode" class="chip">Normalize 0–100</button>
+            </div>
+          </div>
+          <div id="healthChart" class="chart health-chart"></div>
+          <div id="healthSummary" class="health-summary"></div>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <template id="emptyTemplate">
+    <div class="empty-state">
+      <div class="empty-icon">⌁</div>
+      <h4>No data</h4>
+      <p></p>
+    </div>
+  </template>
+
+  <script src="/app.js"></script>
+</body>
+</html>
