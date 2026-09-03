@@ -86,8 +86,8 @@ async function staticApi(path, params = {}) {
     }
     const series = ((data.healthSeries && data.healthSeries[runId] || {})[key]) || [];
     const summary = ((data.healthSummary[runId] || {})[params.resource_id]) || null;
-    const hasMongo = series.some(s => ['MongoDB','MongoAtlas'].some(marker => String(s.HealthSource || '').includes(marker)) || ['StorageSize','IndexSize','LongRunningSlowQueries','Connections','AtlasTier','SlowQueryNamespaces'].includes(s.MetricCategory));
-    const hasAzure = series.some(s => String(s.HealthSource || '').includes('Azure') || ['CPU','MemoryUsage','Disk','Network','SNAT','TrafficGiB','AvgConn','SNATPeak'].includes(s.MetricCategory));
+    const hasMongo = series.some(s => ['MongoDB','MongoAtlas'].some(marker => String(s.HealthSource || '').includes(marker)) || ['StorageSize','Connections','AtlasTier','SlowQueryCount','SlowQueryNamespaces'].includes(s.MetricCategory));
+    const hasAzure = series.some(s => String(s.HealthSource || '').includes('Azure') || (!['MongoDB','MongoAtlas'].some(marker => String(s.HealthSource || '').includes(marker)) && ['CPU','MemoryUsage','Disk','Network','SNAT','TrafficGiB','AvgConn','SNATPeak'].includes(s.MetricCategory)));
     const mongoRecord = ((data.mongoHealth && data.mongoHealth[runId]) || []).find(r => r.ResourceID === params.resource_id);
     const azureRecord = ((data.azureHealth && data.azureHealth[runId]) || []).find(r => r.ResourceID === params.resource_id);
     const coverageRows = ((data.healthCoverage && data.healthCoverage[runId]) || {})[params.resource_id] || [];
@@ -117,6 +117,48 @@ function severityColor(sev) {
 function metricColor(i) { return ['#7170ff','#10b981','#f59e0b','#60a5fa','#ff4d6d','#a78bfa','#22d3ee'][i % 7]; }
 function fmt(n, digits=2) { return n === null || n === undefined || Number.isNaN(Number(n)) ? '—' : Number(n).toLocaleString(undefined, {maximumFractionDigits: digits}); }
 function shortRid(rid) { return rid && rid.includes('/') ? rid.split('/').filter(Boolean).slice(-1)[0] : rid; }
+function isMongoHealthPayload(payload) {
+  const series = (payload && payload.series) || [];
+  return Boolean(payload && (payload.health_kind === 'mongodb' || series.some(s => ['MongoDB','MongoAtlas'].some(marker => String(s.HealthSource || '').includes(marker)) || ['StorageSize','Connections','AtlasTier','SlowQueryCount','SlowQueryNamespaces'].includes(s.MetricCategory))));
+}
+function isPlottableHealthSeries(series) {
+  const category = String((series && series.MetricCategory) || '');
+  if (['AtlasTier', 'SlowQueryCount', 'SlowQueryNamespaces'].includes(category)) return false;
+  return true;
+}
+function mongoKpiMetaAt(payload, timestamp) {
+  const matches = [];
+  ((payload && payload.series) || []).forEach(s => (s.Points || []).forEach(p => {
+    if (!timestamp || p.Timestamp === timestamp) matches.push({series: s, point: p});
+  }));
+  const summary = (payload && payload.summary) || {};
+  const healthSummary = summary.HealthSummary || {};
+  const point = (matches.find(m => m.point.Tier || m.point.SlowQueryCount !== undefined) || {}).point || {};
+  const slowPoint = (matches.find(m => m.point.SlowQueryCount !== undefined) || {}).point || point;
+  const namespaces = slowPoint.SlowQueryNamespaces || slowPoint.Namespaces || healthSummary.SlowQueryNamespaces || [];
+  return {
+    timestamp,
+    tier: point.Tier || summary.Tier || healthSummary.LatestTier || 'Not Available',
+    slowQueryCount: slowPoint.SlowQueryCount ?? healthSummary.SlowQueryCount ?? 0,
+    slowQueryNamespaces: Array.isArray(namespaces) ? namespaces : [],
+    storageSizeMB: point.StorageSizeMB ?? point.MemoryResidentMB ?? healthSummary.PeakStorageSizeMB ?? null,
+  };
+}
+function renderMongoPointKpis(timestamp) {
+  const container = $('mongoPointKpis');
+  if (!container || !isMongoHealthPayload(state.lastHealthPayload)) return;
+  if (!timestamp) {
+    container.innerHTML = '<div class="health-card"><strong>MongoDB point KPIs</strong><span class="muted">Click an hourly MongoDB health point to show Tier and SlowQueryCount for that exact hour.</span></div>';
+    return;
+  }
+  const kpi = mongoKpiMetaAt(state.lastHealthPayload, timestamp);
+  const nsText = kpi.slowQueryNamespaces.length ? kpi.slowQueryNamespaces.slice(0, 6).join(', ') : 'None';
+  container.innerHTML = `
+    <div class="health-card"><strong>Selected hour</strong><span class="muted mono">${esc(kpi.timestamp)}</span></div>
+    <div class="health-card"><strong>Tier KPI</strong><span class="muted">${esc(kpi.tier)}</span></div>
+    <div class="health-card"><strong>SlowQueryCount KPI</strong><span class="muted">${fmt(kpi.slowQueryCount, 0)}</span></div>
+    <div class="health-card"><strong>Slow query namespaces</strong><span class="muted">${esc(nsText)}</span></div>`;
+}
 function esc(s) { return String(s ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
 
 function showEmpty(container, message) {
@@ -330,12 +372,12 @@ async function selectCostPoint(row) {
 function renderHealthChart(payload) {
   const el = $('healthChart');
   if (!payload) return showEmpty(el, 'Health drilldown will appear after selecting a resource-level cost point.');
-  const series = payload.series || [];
+  const series = (payload.series || []).filter(isPlottableHealthSeries);
   if (!series.length) return showEmpty(el, payload.message || 'No hourly health series available for this point.');
   const normalized = state.healthMode === 'normalized';
   const w = Math.max(el.clientWidth || 900, 640), h = 300, m = {l:58,r:24,t:24,b:48};
   const flat = [];
-  series.forEach((s, si) => (s.Points||[]).forEach(p => flat.push({s, si, t:p.Timestamp, v:Number(p.Value)})));
+  series.forEach((s, si) => (s.Points||[]).forEach((p, pi) => flat.push({s, si, pi, point:p, t:p.Timestamp, v:Number(p.Value)})));
   if (!flat.length) return showEmpty(el, 'Health time-series contained no points.');
   const times = [...new Set(flat.map(p => p.t))].sort();
   const byTime = new Map(times.map((t,i)=>[t,i]));
@@ -352,7 +394,7 @@ function renderHealthChart(payload) {
   const yTicks = [0,.25,.5,.75,1].map(p => minY + p*(maxY-minY));
   const paths = series.map((s, si) => {
     const pts = (s.Points||[]).filter(p => !Number.isNaN(Number(p.Value))).map((p,i) => `${i?'L':'M'}${x(p.Timestamp)},${y(plotVal(s, Number(p.Value)))}`).join(' ');
-    return `<path class="line" d="${pts}" stroke="${metricColor(si)}"></path>${(s.Points||[]).map(p => `<circle class="point" cx="${x(p.Timestamp)}" cy="${y(plotVal(s, Number(p.Value)))}" r="4" fill="${metricColor(si)}"></circle>`).join('')}`;
+    return `<path class="line" d="${pts}" stroke="${metricColor(si)}"></path>${(s.Points||[]).map((p, pi) => `<circle class="point" data-si="${si}" data-pi="${pi}" cx="${x(p.Timestamp)}" cy="${y(plotVal(s, Number(p.Value)))}" r="4" fill="${metricColor(si)}"></circle>`).join('')}`;
   }).join('');
   el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
     ${yTicks.map(v => `<line class="grid-line" x1="${m.l}" y1="${y(v)}" x2="${w-m.r}" y2="${y(v)}"></line><text class="axis-text" x="8" y="${y(v)+4}">${fmt(v)}</text>`).join('')}
@@ -360,17 +402,27 @@ function renderHealthChart(payload) {
     ${paths}
     ${times.map((t,i) => (i % Math.ceil(times.length/8)===0 || i===times.length-1) ? `<text class="axis-text" x="${x(t)-18}" y="${h-16}">${esc(t.slice(11,16))}</text>` : '').join('')}
   </svg>`;
+  el.querySelectorAll('.point').forEach(pt => {
+    const s = series[Number(pt.dataset.si)];
+    const p = s && (s.Points || [])[Number(pt.dataset.pi)];
+    if (!s || !p) return;
+    pt.addEventListener('mouseenter', e => tooltip(e, `<strong>${esc(p.Timestamp)}</strong><br/>${esc(s.MetricCategory || s.MetricName)}: ${fmt(p.Value)} ${esc(s.Unit || '')}`));
+    pt.addEventListener('mouseleave', hideTooltip);
+    pt.addEventListener('click', () => renderMongoPointKpis(p.Timestamp));
+  });
 }
 
 function renderHealthSummary(payload) {
   const s = payload.summary || {};
-  const series = payload.series || [];
+  const series = (payload.series || []).filter(isPlottableHealthSeries);
   const metricCards = series.length ? series.map((m,i) => `<div class="health-card"><strong style="color:${metricColor(i)}">${esc(m.MetricCategory || m.MetricName)}</strong><span class="muted">${esc(m.MetricName)} · ${esc(m.Unit || 'unit')} · ${(m.Points||[]).length} pts</span></div>`).join('') : '';
+  const mongoPointKpis = isMongoHealthPayload(payload) ? '<div id="mongoPointKpis" class="mongo-point-kpis" style="grid-column:1/-1"><div class="health-card"><strong>MongoDB point KPIs</strong><span class="muted">Click an hourly MongoDB health point to show Tier and SlowQueryCount for that exact hour.</span></div></div>' : '';
   $('healthSummary').innerHTML = `
     <div class="health-card"><strong>Correlation</strong><span class="muted">${esc(s.CostHealthCorrelation || 'Not Available')}</span></div>
     <div class="health-card"><strong>Overall health</strong><span class="muted">${esc(s.OverallHealthStatus || 'Not Available')}</span></div>
     <div class="health-card"><strong>Source</strong><span class="muted">${esc(payload.source)}</span></div>
     ${metricCards}
+    ${mongoPointKpis}
     <div class="health-card" style="grid-column:1/-1"><strong>Reason</strong><span class="muted">${esc(s.HealthAnalysisReason || payload.message || 'No health summary available.')}</span></div>`;
 }
 

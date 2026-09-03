@@ -41,11 +41,12 @@ def make_fixture(tmp_path: Path):
         }}
     ]
     mongo_rows = [
-        {"ResourceID": "rid-b", "MongoDBResource": "Platform_MongoDB", "HealthSource": "MongoDBCommandsOnly", "Metrics": {
-            "StorageSize": [{"Timestamp": "2026-05-01T00:00:00Z", "Value": 2048, "Unit": "Bytes", "MetricName": "dbStats.total.storageSize"}],
+        {"ResourceID": "rid-b", "MongoDBResource": "Platform_MongoDB", "HealthSource": "MongoAtlasCronJob", "Metrics": {
+            "StorageSize": [{"Timestamp": "2026-05-01T00:00:00Z", "Value": 2048, "Unit": "MB", "MetricName": "cluster_metrics.memory.resident_mb", "Tier": "M50", "SlowQueryCount": 2}],
+            "MemoryUsage": [{"Timestamp": "2026-05-01T00:00:00Z", "Value": 55.5, "Unit": "Percent", "MetricName": "cluster_metrics.memory.usage_percent", "Tier": "M50", "SlowQueryCount": 2}],
             "IndexSize": [{"Timestamp": "2026-05-01T00:00:00Z", "Value": 128, "Unit": "Bytes", "MetricName": "dbStats.total.indexSize"}],
             "LongRunningSlowQueries": [{"Timestamp": "2026-05-01T00:00:00Z", "Value": 2, "Unit": "Count", "MetricName": "currentOp.longRunningOperations"}],
-            "Connections": [{"Timestamp": "2026-05-01T00:00:00Z", "Value": 22, "Unit": "Count", "MetricName": "connections.current"}],
+            "Connections": [{"Timestamp": "2026-05-01T00:00:00Z", "Value": 22, "Unit": "Count", "MetricName": "cluster_metrics.connections.current", "Tier": "M50", "SlowQueryCount": 2}],
             "IOPs": [{"Timestamp": "2026-05-01T00:00:00Z", "Value": 99, "Unit": "Count", "MetricName": "opcounters.query"}]
         }}
     ]
@@ -133,8 +134,10 @@ class DashboardApiTests(unittest.TestCase):
         payload = dashboard_api.health_timeseries(self.tmp_path, self.ts, "rid-b", "2026-05-01")
         self.assertEqual(payload["source"], "Mongo_Health_Analysis")
         self.assertEqual(payload["health_kind"], "mongodb")
-        self.assertEqual([s["MetricCategory"] for s in payload["series"]], ["StorageSize", "IndexSize", "LongRunningSlowQueries", "Connections", "IOPs"])
-        self.assertEqual(payload["series"][3]["Points"][0]["Value"], 22)
+        self.assertEqual([s["MetricCategory"] for s in payload["series"]], ["Connections", "MemoryUsage", "StorageSize"])
+        self.assertEqual(payload["series"][0]["Points"][0]["Value"], 22)
+        self.assertEqual(payload["series"][0]["Points"][0]["Tier"], "M50")
+        self.assertEqual(payload["series"][0]["Points"][0]["SlowQueryCount"], 2)
 
     def test_health_timeseries_includes_nat_gateway_cost_justification_series(self):
         rid = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/natGateways/nat-1"
@@ -253,7 +256,8 @@ class DashboardApiTests(unittest.TestCase):
             azure_shard = json.loads((plugin / "dist" / azure_entry["file"]).read_text(encoding="utf-8"))
             mongo_shard = json.loads((plugin / "dist" / mongo_entry["file"]).read_text(encoding="utf-8"))
             self.assertEqual(azure_shard["series"][0]["MetricCategory"], "CPU")
-            self.assertEqual(mongo_shard["series"][0]["MetricCategory"], "StorageSize")
+            self.assertEqual([s["MetricCategory"] for s in mongo_shard["series"]], ["Connections", "MemoryUsage", "StorageSize"])
+            self.assertEqual(mongo_shard["series"][0]["Points"][0]["Tier"], "M50")
 
 
 if __name__ == "__main__":

@@ -263,13 +263,17 @@ def overall_cost_timeseries(data_dir: str | Path = DEFAULT_DATA_DIR, run_id: str
 def _series_from_split_health_records(rows: list[dict[str, Any]], resource_id: str, date: str | None, source: str) -> list[dict[str, Any]]:
     """Flatten Azure_Health_Analysis/Mongo_Health_Analysis resource records into dashboard series."""
     output: list[dict[str, Any]] = []
+    mongo_graph_categories = {"Connections", "MemoryUsage", "StorageSize"}
     for row in rows:
         if row.get("ResourceID") != resource_id:
             continue
         metrics = row.get("Metrics") or {}
         if not isinstance(metrics, dict):
             continue
+        row_is_mongo = source == "Mongo_Health_Analysis" or any(marker in str(row.get("HealthSource") or "") for marker in ["MongoDB", "MongoAtlas"])
         for category, points in metrics.items():
+            if row_is_mongo and str(category) not in mongo_graph_categories:
+                continue
             if not isinstance(points, list):
                 continue
             selected = []
@@ -282,7 +286,11 @@ def _series_from_split_health_records(rows: list[dict[str, Any]], resource_id: s
                 value = _safe_float(point.get("Value"))
                 if value is None:
                     continue
-                selected.append({"Timestamp": ts, "Value": value})
+                compact_point = {"Timestamp": ts, "Value": value}
+                for extra_key in ["Tier", "SlowQueryCount", "SlowQueryNamespaces", "MemoryTotalMB", "CpuCores", "MemoryResidentMB", "StorageSizeMB"]:
+                    if extra_key in point:
+                        compact_point[extra_key] = point.get(extra_key)
+                selected.append(compact_point)
             if not selected:
                 continue
             selected.sort(key=lambda p: p.get("Timestamp") or "")
@@ -298,8 +306,12 @@ def _series_from_split_health_records(rows: list[dict[str, Any]], resource_id: s
                 "HealthSource": row.get("HealthSource") or source,
                 "Points": selected,
             })
-    preferred = ["CPU", "MemoryUsage", "Disk", "Network", "SNAT", "TrafficGiB", "AvgConn", "SNATPeak", "StorageSize", "IndexSize", "LongRunningSlowQueries", "Connections", "IOPs"]
+    preferred = ["CPU", "MemoryUsage", "Disk", "Network", "SNAT", "TrafficGiB", "AvgConn", "SNATPeak", "Connections", "StorageSize", "IOPs"]
+    mongo_preferred = ["Connections", "MemoryUsage", "StorageSize"]
     rank = {name: i for i, name in enumerate(preferred)}
+    mongo_rank = {name: i for i, name in enumerate(mongo_preferred)}
+    if source == "Mongo_Health_Analysis":
+        return sorted(output, key=lambda s: (mongo_rank.get(s.get("MetricCategory"), 999), s.get("MetricCategory") or ""))
     return sorted(output, key=lambda s: (rank.get(s.get("MetricCategory"), 999), s.get("MetricCategory") or ""))
 
 

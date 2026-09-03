@@ -25,17 +25,32 @@ def static_plugin_html(cache_bust: str | None = None) -> str:
     return html
 
 
+def compact_health_point(point: dict) -> dict:
+    """Keep plotted value plus MongoDB per-hour KPI metadata in health shards."""
+    compact = {'Timestamp': point.get('Timestamp'), 'Value': point.get('Value')}
+    for key in ['Tier', 'SlowQueryCount', 'SlowQueryNamespaces', 'MemoryTotalMB', 'CpuCores', 'MemoryResidentMB', 'StorageSizeMB']:
+        if key in point:
+            compact[key] = point.get(key)
+    return compact
+
+
 def _group_split_health_series(rows: list[dict], source: str) -> dict[str, list[dict]]:
     """Build static healthSeries map keyed by ResourceID|Date from split health artifacts."""
     grouped: dict[str, list[dict]] = {}
-    preferred = ["CPU", "MemoryUsage", "Disk", "Network", "SNAT", "TrafficGiB", "AvgConn", "SNATPeak", "StorageSize", "IndexSize", "LongRunningSlowQueries", "Connections", "IOPs"]
+    mongo_graph_categories = {"Connections", "MemoryUsage", "StorageSize"}
+    preferred = ["CPU", "MemoryUsage", "Disk", "Network", "SNAT", "TrafficGiB", "AvgConn", "SNATPeak", "Connections", "StorageSize", "IOPs"]
+    mongo_preferred = ["Connections", "MemoryUsage", "StorageSize"]
     rank = {name: i for i, name in enumerate(preferred)}
+    mongo_rank = {name: i for i, name in enumerate(mongo_preferred)}
     for row in rows:
         rid = row.get('ResourceID')
         metrics = row.get('Metrics') or {}
         if not rid or not isinstance(metrics, dict):
             continue
+        row_is_mongo = source == 'MongoDBCommandsOnly' or any(marker in str(row.get('HealthSource') or '') for marker in ['MongoDB', 'MongoAtlas'])
         for category, points in metrics.items():
+            if row_is_mongo and str(category) not in mongo_graph_categories:
+                continue
             by_day: dict[str, list[dict]] = {}
             if not isinstance(points, list):
                 continue
@@ -58,22 +73,28 @@ def _group_split_health_series(rows: list[dict], source: str) -> dict[str, list[
                     'Unit': first.get('Unit') or 'Unknown',
                     'Aggregation': first.get('Aggregation') or row.get('Aggregation') or 'Hourly',
                     'HealthSource': row.get('HealthSource') or source,
-                    'Points': [{'Timestamp': p.get('Timestamp'), 'Value': p.get('Value')} for p in pts],
+                    'Points': [compact_health_point(p) for p in pts],
                 })
     for key, items in grouped.items():
-        items.sort(key=lambda s: (rank.get(s.get('MetricCategory'), 999), s.get('MetricCategory') or ''))
+        if _health_kind_for_series(items) == 'mongodb':
+            items.sort(key=lambda s: (mongo_rank.get(s.get('MetricCategory'), 999), s.get('MetricCategory') or ''))
+        else:
+            items.sort(key=lambda s: (rank.get(s.get('MetricCategory'), 999), s.get('MetricCategory') or ''))
     return grouped
 
 
 def _health_kind_for_series(items: list[dict]) -> str:
     has_mongo = any(
         any(marker in str(item.get('HealthSource') or '') for marker in ['MongoDB', 'MongoAtlas'])
-        or item.get('MetricCategory') in {'StorageSize', 'IndexSize', 'LongRunningSlowQueries', 'Connections', 'AtlasTier', 'SlowQueryNamespaces'}
+        or item.get('MetricCategory') in {'StorageSize', 'Connections', 'AtlasTier', 'SlowQueryCount', 'SlowQueryNamespaces'}
         for item in items
     )
     has_azure = any(
         'Azure' in str(item.get('HealthSource') or '')
-        or item.get('MetricCategory') in {'CPU', 'MemoryUsage', 'Disk', 'Network', 'SNAT', 'TrafficGiB', 'AvgConn', 'SNATPeak'}
+        or (
+            not any(marker in str(item.get('HealthSource') or '') for marker in ['MongoDB', 'MongoAtlas'])
+            and item.get('MetricCategory') in {'CPU', 'MemoryUsage', 'Disk', 'Network', 'SNAT', 'TrafficGiB', 'AvgConn', 'SNATPeak'}
+        )
         for item in items
     )
     if has_mongo and not has_azure:
