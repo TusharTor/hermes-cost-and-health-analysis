@@ -13,6 +13,7 @@ PLUGIN = Path('/opt/data/plugins/cloudvitals/dashboard')
 DATA_DIR = Path('/opt/data')
 sys.path.insert(0, str(ROOT))
 import dashboard_api  # noqa: E402
+import cronicle_correlation  # noqa: E402
 
 
 def static_plugin_html(cache_bust: str | None = None) -> str:
@@ -28,7 +29,7 @@ def static_plugin_html(cache_bust: str | None = None) -> str:
 def compact_health_point(point: dict) -> dict:
     """Keep plotted value plus MongoDB per-hour KPI metadata in health shards."""
     compact = {'Timestamp': point.get('Timestamp'), 'Value': point.get('Value')}
-    for key in ['Tier', 'SlowQueryCount', 'SlowQueryNamespaces', 'MemoryTotalMB', 'CpuCores', 'MemoryResidentMB', 'StorageSizeMB']:
+    for key in ['Tier', 'SlowQueryCount', 'SlowQueryNamespaces', 'MemoryTotalMB', 'CpuCores', 'MemoryResidentMB', 'StorageSizeMB', 'CronicleContext', 'CronicleJobs']:
         if key in point:
             compact[key] = point.get(key)
     return compact
@@ -170,6 +171,16 @@ def publish(run_id: str = 'latest') -> dict:
     if mongo_path and Path(mongo_path).exists():
         with open(mongo_path, encoding='utf-8') as fh:
             mongo_health_rows = json.load(fh)
+        # Cronicle dashboard KPI context is derived from cronicle_history.sqlite3
+        # at publish time. Existing embedded Cronicle fields are stripped and
+        # rebuilt by the Analyzer so the SQLite DB remains the source of truth.
+        mongo_health_rows, _cronicle_summary = cronicle_correlation.enrich_mongo_health_rows(
+            mongo_health_rows,
+            db_path=Path('/opt/data/cronicle_history.sqlite3'),
+            window_minutes=30,
+            cpu_threshold=50.0,
+            max_results=10,
+        )
         for key, items in _group_split_health_series(mongo_health_rows, 'MongoDBCommandsOnly').items():
             health_series.setdefault(key, []).extend(items)
     ts_path = run['files'].get('health_timeseries')

@@ -18,6 +18,10 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 DEFAULT_DATA_DIR = Path(os.environ.get("COST_HEALTH_DATA_DIR", "/opt/data"))
+DEFAULT_CRONICLE_DB_PATH = Path(os.environ.get("CRONICLE_HISTORY_DB", "/opt/data/cronicle_history.sqlite3"))
+DEFAULT_CRONICLE_WINDOW_MINUTES = int(os.environ.get("CRONICLE_WINDOW_MINUTES", "30"))
+DEFAULT_CRONICLE_CPU_THRESHOLD = float(os.environ.get("CRONICLE_CPU_THRESHOLD", "50"))
+DEFAULT_CRONICLE_MAX_RESULTS = int(os.environ.get("CRONICLE_MAX_RESULTS", "10"))
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 ROUTE_PREFIX = "/tor-ops-agent/dashboard"
@@ -79,6 +83,10 @@ def _summary_to_run(summary_path: Path, data_dir: Path) -> dict[str, Any]:
     if not mongo_health:
         inferred = data_dir / f"Mongo_Health_Analysis_{mongo_run_id_from_run_id(run_id)}.json"
         mongo_health = str(inferred) if inferred.exists() else None
+    cronicle_analysis = _file_or_none(summary.get("cronicle_analysis_file"), data_dir)
+    if not cronicle_analysis:
+        inferred = data_dir / f"Cronicle_Analysis_{run_id}.json"
+        cronicle_analysis = str(inferred) if inferred.exists() else None
     files = {
         "summary": str(summary_path),
         "cost": _file_or_none(summary.get("cost_file"), data_dir) or str(data_dir / f"Cost-Analysis_{run_id}.json"),
@@ -87,6 +95,7 @@ def _summary_to_run(summary_path: Path, data_dir: Path) -> dict[str, Any]:
         "azure_health": azure_health,
         "mongo_health": mongo_health,
         "health_timeseries": health_ts,
+        "cronicle_analysis": cronicle_analysis,
         "chart": _file_or_none(summary.get("chart_file"), data_dir),
     }
     return {
@@ -136,6 +145,7 @@ def _infer_runs_without_summary(data_dir: Path) -> list[dict[str, Any]]:
                 "azure_health": str(azure_path) if azure_path.exists() else None,
                 "mongo_health": str(mongo_path) if mongo_path.exists() else None,
                 "health_timeseries": str(health_ts_path) if health_ts_path.exists() else None,
+                "cronicle_analysis": str(data_dir / f"Cronicle_Analysis_{run_id}.json") if (data_dir / f"Cronicle_Analysis_{run_id}.json").exists() else None,
                 "chart": None,
             },
             "has_health_timeseries": health_ts_path.exists(),
@@ -181,6 +191,139 @@ def _load_run_file(data_dir: str | Path, run_id: str | None, kind: str) -> Any:
     return read_json(path)
 
 
+def _extract_cost_rows(payload: Any) -> list[dict[str, Any]]:
+    """Return historical cost-analysis rows from legacy list or forecast-aware dict payloads."""
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if isinstance(payload, dict):
+        for key in [
+            "CostAnalysis",
+            "CostAnalysisRecords",
+            "CostRecords",
+            "Records",
+            "Data",
+            "Items",
+            "Costs",
+            "cost_analysis",
+            "cost_records",
+        ]:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [row for row in value if isinstance(row, dict)]
+        if payload.get("ResourceID"):
+            return [payload]
+    return []
+
+
+def _extract_forecast(payload: Any, run: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return forecast payload from Cost-Analysis or summary without assuming one exact shape."""
+    if isinstance(payload, dict):
+        forecast = payload.get("Forecast") or payload.get("forecast")
+        if isinstance(forecast, dict):
+            return forecast
+    if run:
+        forecast = (run.get("summary") or {}).get("Forecast") or (run.get("summary") or {}).get("forecast")
+        if isinstance(forecast, dict):
+            return forecast
+    return {}
+
+
+def _is_predicted_cost_row(row: dict[str, Any]) -> bool:
+    marker = str(row.get("PointType") or row.get("CostType") or row.get("Type") or "").lower()
+    return bool(row.get("IsPredicted") or row.get("Predicted") or marker in {"predicted", "forecast", "forecasted"})
+
+
+def _prediction_date_value(point: dict[str, Any]) -> tuple[str | None, float | None]:
+    date = point.get("Date") or point.get("AnalysisDate") or point.get("ForecastDate") or point.get("UsageDate")
+    value = _safe_float(point.get("PredictedCost"))
+    if value is None:
+        value = _safe_float(point.get("CostAmount"))
+    if value is None:
+        value = _safe_float(point.get("Value"))
+    return (str(date)[:10] if date else None, value)
+
+
+def _forecast_meta(forecast: dict[str, Any], resource_forecast: dict[str, Any] | None = None) -> dict[str, Any]:
+    resource_forecast = resource_forecast or {}
+    return {
+        "ForecastStart": resource_forecast.get("ForecastStart") or forecast.get("ForecastStart"),
+        "ForecastEnd": resource_forecast.get("ForecastEnd") or forecast.get("ForecastEnd"),
+        "ForecastDays": resource_forecast.get("ForecastDays") or forecast.get("ForecastDays"),
+        "ForecastModel": resource_forecast.get("ForecastModel") or forecast.get("ForecastModel"),
+        "ValidationMetrics": resource_forecast.get("ValidationMetrics") or forecast.get("ValidationMetrics"),
+        "ValidationStatus": resource_forecast.get("ValidationStatus") or forecast.get("ValidationStatus"),
+    }
+
+
+def _normalise_prediction_point(point: dict[str, Any], forecast: dict[str, Any], resource_forecast: dict[str, Any] | None = None, resource_id: str | None = None) -> dict[str, Any] | None:
+    date, value = _prediction_date_value(point)
+    if not date or value is None:
+        return None
+    meta = _forecast_meta(forecast, resource_forecast)
+    row = {
+        "AnalysisDate": date,
+        "CostAmount": value,
+        "PredictedCost": value,
+        "IsPredicted": True,
+        "PointType": "Predicted",
+        "TrendStatus": "Predicted Cost",
+        "Severity": "Normal",
+        "AnalysisReason": "Forecasted cost point generated from the selected-period training data.",
+    }
+    if resource_id:
+        row["ResourceID"] = resource_id
+    for key, val in meta.items():
+        if val is not None:
+            row[key] = val
+    return row
+
+
+def _daily_predictions(container: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(container, dict):
+        return []
+    for key in ["DailyPredictions", "daily_predictions", "Predictions", "predictions"]:
+        value = container.get(key)
+        if isinstance(value, list):
+            return [point for point in value if isinstance(point, dict)]
+    return []
+
+
+def _overall_forecast_points(payload: Any, run: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    forecast = _extract_forecast(payload, run)
+    overall = forecast.get("Overall") or forecast.get("overall") or {}
+    return [row for point in _daily_predictions(overall) if (row := _normalise_prediction_point(point, forecast, overall))]
+
+
+def _resource_forecast_points(payload: Any, resource_id: str, run: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    forecast = _extract_forecast(payload, run)
+    containers = []
+    for key in ["AffectedResources", "ResourceForecasts", "Resources", "resource_forecasts"]:
+        value = forecast.get(key)
+        if isinstance(value, list):
+            containers.extend(item for item in value if isinstance(item, dict) and item.get("ResourceID") == resource_id)
+        elif isinstance(value, dict):
+            item = value.get(resource_id)
+            if isinstance(item, dict):
+                containers.append({"ResourceID": resource_id, **item})
+    predicted: list[dict[str, Any]] = []
+    for container in containers:
+        for point in _daily_predictions(container):
+            row = _normalise_prediction_point(point, forecast, container, resource_id)
+            if row:
+                predicted.append(row)
+    return predicted
+
+
+def _merge_actual_and_predicted(actual: list[dict[str, Any]], predicted: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    actual_dates = {str(row.get("AnalysisDate")) for row in actual if row.get("AnalysisDate")}
+    merged = list(actual)
+    for row in predicted:
+        if str(row.get("AnalysisDate")) in actual_dates:
+            continue
+        merged.append(row)
+    return sorted(merged, key=lambda r: (str(r.get("AnalysisDate") or ""), 1 if _is_predicted_cost_row(r) else 0))
+
+
 def health_summary_map(data_dir: str | Path, run_id: str | None) -> dict[str, dict[str, Any]]:
     try:
         rows = _load_run_file(data_dir, run_id, "health")
@@ -190,7 +333,7 @@ def health_summary_map(data_dir: str | Path, run_id: str | None) -> dict[str, di
 
 
 def affected_resources(data_dir: str | Path = DEFAULT_DATA_DIR, run_id: str | None = None) -> list[dict[str, Any]]:
-    cost_rows = _load_run_file(data_dir, run_id, "cost")
+    cost_rows = _extract_cost_rows(_load_run_file(data_dir, run_id, "cost"))
     hmap = health_summary_map(data_dir, run_id)
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in cost_rows:
@@ -235,29 +378,64 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _cronicle_context_for_mongo_point(row: dict[str, Any], timestamp: str) -> dict[str, Any] | None:
+    """Return dashboard-safe Cronicle KPI context from SQLite only."""
+    if row.get("ResourceID") != "Platform_MongoDb" and row.get("MongoDBResourceID") != "Cluster_Platform":
+        return None
+    if not timestamp:
+        return None
+    try:
+        import cronicle_correlation
+        return cronicle_correlation.analyze_jobs_near_anomaly(
+            timestamp,
+            db_path=DEFAULT_CRONICLE_DB_PATH,
+            window_minutes=DEFAULT_CRONICLE_WINDOW_MINUTES,
+            cpu_threshold=DEFAULT_CRONICLE_CPU_THRESHOLD,
+            max_results=DEFAULT_CRONICLE_MAX_RESULTS,
+        )
+    except Exception as exc:
+        return {
+            "status": "CronicleAnalyzerUnavailable",
+            "timestamp": timestamp,
+            "window_minutes": DEFAULT_CRONICLE_WINDOW_MINUTES,
+            "cpu_threshold": DEFAULT_CRONICLE_CPU_THRESHOLD,
+            "jobs": [],
+            "note": f"Cronicle Analyzer could not read cronicle_history.sqlite3: {type(exc).__name__}.",
+        }
+
+
 def cost_timeseries(data_dir: str | Path = DEFAULT_DATA_DIR, run_id: str | None = None, resource_id: str | None = None) -> list[dict[str, Any]]:
     if not resource_id:
         raise DashboardError(400, "resource_id is required")
-    rows = _load_run_file(data_dir, run_id, "cost")
-    selected = [r for r in rows if r.get("ResourceID") == resource_id]
-    if not selected:
+    run = get_run(data_dir, run_id)
+    payload = _load_run_file(data_dir, run["run_id"], "cost")
+    rows = _extract_cost_rows(payload)
+    selected = [r for r in rows if r.get("ResourceID") == resource_id and not _is_predicted_cost_row(r)]
+    predicted = _resource_forecast_points(payload, resource_id, run)
+    if not selected and not predicted:
         raise DashboardError(404, f"No cost rows found for resource: {resource_id}")
-    keys = ["ResourceID", "ResourceType", "AnalysisDate", "CostAmount", "AverageCost", "PreviousCost", "DayOverDayChange", "PercentageChange", "Trend", "TrendStatus", "IsAnomaly", "AnomalyType", "ExpectedCost", "Deviation", "DeviationPercentage", "ZScore", "Severity", "IsPeakCost", "IsMinimumCost", "AnalysisReason"]
-    compact = [{k: r.get(k) for k in keys} for r in selected]
-    return sorted(compact, key=lambda r: r.get("AnalysisDate") or "")
+    keys = ["ResourceID", "ResourceType", "AnalysisDate", "CostAmount", "AverageCost", "PreviousCost", "DayOverDayChange", "PercentageChange", "Trend", "TrendStatus", "IsAnomaly", "AnomalyType", "ExpectedCost", "Deviation", "DeviationPercentage", "ZScore", "Severity", "IsPeakCost", "IsMinimumCost", "AnalysisReason", "PredictedCost", "IsPredicted", "PointType", "ForecastStart", "ForecastEnd", "ForecastDays", "ForecastModel", "ValidationMetrics", "ValidationStatus"]
+    compact = [{k: r.get(k) for k in keys if k in r} for r in selected]
+    return _merge_actual_and_predicted(compact, predicted)
 
 
 def overall_cost_timeseries(data_dir: str | Path = DEFAULT_DATA_DIR, run_id: str | None = None) -> list[dict[str, Any]]:
-    """Aggregate daily CostAmount across resources represented in a run's cost analysis."""
-    rows = _load_run_file(data_dir, run_id, "cost")
+    """Aggregate actual daily cost and append overall forecast points when present."""
+    run = get_run(data_dir, run_id)
+    payload = _load_run_file(data_dir, run["run_id"], "cost")
+    rows = _extract_cost_rows(payload)
     totals: dict[str, float] = defaultdict(float)
     for row in rows:
+        if _is_predicted_cost_row(row):
+            continue
         analysis_date = row.get("AnalysisDate")
         cost_amount = _safe_float(row.get("CostAmount"))
         if not analysis_date or cost_amount is None:
             continue
         totals[str(analysis_date)] += cost_amount
-    return [{"AnalysisDate": day, "CostAmount": totals[day]} for day in sorted(totals)]
+    actual = [{"AnalysisDate": day, "CostAmount": totals[day]} for day in sorted(totals)]
+    predicted = _overall_forecast_points(payload, run)
+    return _merge_actual_and_predicted(actual, predicted)
 
 
 def _series_from_split_health_records(rows: list[dict[str, Any]], resource_id: str, date: str | None, source: str) -> list[dict[str, Any]]:
@@ -290,6 +468,11 @@ def _series_from_split_health_records(rows: list[dict[str, Any]], resource_id: s
                 for extra_key in ["Tier", "SlowQueryCount", "SlowQueryNamespaces", "MemoryTotalMB", "CpuCores", "MemoryResidentMB", "StorageSizeMB"]:
                     if extra_key in point:
                         compact_point[extra_key] = point.get(extra_key)
+                if row_is_mongo:
+                    cronicle_context = _cronicle_context_for_mongo_point(row, ts)
+                    if cronicle_context is not None:
+                        compact_point["CronicleContext"] = cronicle_context
+                        compact_point["CronicleJobs"] = cronicle_context.get("jobs", [])
                 selected.append(compact_point)
             if not selected:
                 continue

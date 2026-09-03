@@ -36,10 +36,10 @@ class Element {
       this.childrenBySelector.set('.resource-row', rows);
     }
     if (this.id === 'costChart') {
-      const points = [...this._innerHTML.matchAll(/<circle class="point" data-idx="(\d+)"/g)].map(match => {
+      const points = [...this._innerHTML.matchAll(/<circle class="([^"]*\bpoint\b[^"]*)" data-idx="(\d+)"/g)].map(match => {
         const point = new Element();
-        point.classList = new ClassList('point');
-        point.dataset.idx = match[1];
+        point.classList = new ClassList(match[1]);
+        point.dataset.idx = match[2];
         return point;
       });
       this.childrenBySelector.set('.point', points);
@@ -113,7 +113,8 @@ function makeHarness() {
           run1: {
             'resource-a': [
               {ResourceID: 'resource-a', AnalysisDate: '2026-08-01', CostAmount: 100, Severity: 'Normal', IsAnomaly: false, TrendStatus: 'Stable', AnalysisReason: 'normal'},
-              {ResourceID: 'resource-a', AnalysisDate: '2026-08-02', CostAmount: 200, Severity: 'High', IsAnomaly: true, TrendStatus: 'Cost Spike', AnalysisReason: 'spike'}
+              {ResourceID: 'resource-a', AnalysisDate: '2026-08-02', CostAmount: 200, Severity: 'High', IsAnomaly: true, TrendStatus: 'Cost Spike', AnalysisReason: 'spike'},
+              {ResourceID: 'resource-a', AnalysisDate: '2026-08-03', CostAmount: 225, PredictedCost: 225, IsPredicted: true, PointType: 'Predicted', ForecastModel: 'RandomForestRegressor', ForecastStart: '2026-08-03', ForecastEnd: '2026-08-09'}
             ],
             'resource-b': [
               {ResourceID: 'resource-b', AnalysisDate: '2026-08-01', CostAmount: 50, Severity: 'Low', IsAnomaly: false, TrendStatus: 'Stable', AnalysisReason: 'normal'},
@@ -123,7 +124,11 @@ function makeHarness() {
           run2: {'resource-c': [{ResourceID: 'resource-c', AnalysisDate: '2026-09-01', CostAmount: 9, Severity: 'Medium', IsAnomaly: false, TrendStatus: 'Stable', AnalysisReason: 'normal'}]}
         },
         overallCost: {
-          run1: [{AnalysisDate: '2026-08-01', CostAmount: 150}, {AnalysisDate: '2026-08-02', CostAmount: 275}],
+          run1: [
+            {AnalysisDate: '2026-08-01', CostAmount: 150},
+            {AnalysisDate: '2026-08-02', CostAmount: 275},
+            {AnalysisDate: '2026-08-03', CostAmount: 305, PredictedCost: 305, IsPredicted: true, PointType: 'Predicted', ForecastModel: 'RandomForestRegressor', ForecastStart: '2026-08-03', ForecastEnd: '2026-08-09'}
+          ],
           run2: [{AnalysisDate: '2026-09-01', CostAmount: 9}]
         },
         healthSummary: {run1: {'resource-a': {CostHealthCorrelation: 'No Clear Correlation', OverallHealthStatus: 'Healthy', HealthAnalysisReason: 'ok'}}},
@@ -148,7 +153,9 @@ async function flush() { await Promise.resolve(); await Promise.resolve(); await
   assert.strictEqual(elements.costChartTitle.textContent, 'Overall cost trend');
   assert.strictEqual(elements.costChartSubtitle.textContent, 'All analyzed resources');
   assert.strictEqual(elements.resourceList.querySelectorAll('.resource-row').filter(r => r.classList.contains('active')).length, 0);
-  assert.strictEqual(elements.costChart.querySelectorAll('.point').length, 2, 'overall chart should render aggregate points');
+  assert.strictEqual(elements.costChart.querySelectorAll('.point').length, 3, 'overall chart should render aggregate actual + predicted points');
+  assert.match(elements.costChart.innerHTML, /predicted-cost-line/, 'overall chart should draw a predicted cost segment');
+  assert.match(elements.costLegend.innerHTML, /Predicted cost/, 'legend should bifurcate predicted cost color');
 
   elements.costChart.querySelectorAll('.point')[1].dispatch('click');
   await flush();
@@ -164,6 +171,7 @@ async function flush() { await Promise.resolve(); await Promise.resolve(); await
   assert.strictEqual(elements.overallBtn.classList.contains('hidden'), false);
   assert.strictEqual(vm.runInContext('state.lastHealthPayload', context), null, 'resource selection must not auto-load health');
   assert.strictEqual(elements.resourceList.querySelectorAll('.resource-row').filter(r => r.classList.contains('active')).length, 1);
+  assert.match(elements.costChart.innerHTML, /predicted-cost-line/, 'resource chart should draw a predicted cost segment');
 
   elements.costChart.querySelectorAll('.point')[1].dispatch('click');
   await flush();

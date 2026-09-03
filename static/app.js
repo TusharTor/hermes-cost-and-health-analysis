@@ -1,7 +1,8 @@
 const state = {
   runs: [], runId: null, summary: null, resources: [], filtered: [], selectedResource: null,
   overallCostByRun: {}, selectedSeverity: 'all', healthMode: 'raw', lastHealthPayload: null,
-  followLatest: true, lastLoadedAt: null, refreshTimer: null
+  followLatest: true, lastLoadedAt: null, refreshTimer: null,
+  selectedHealthTimestamp: null
 };
 
 const LIVE_REFRESH_MS = 60_000;
@@ -10,18 +11,22 @@ const APP_BASE = window.CLOUDVITALS_API_BASE || (window.location.pathname === TO
 const $ = (id) => document.getElementById(id);
 
 function aggregateOverallCost(costByResource = {}) {
-  const totals = new Map();
+  const actualTotals = new Map();
+  const predictedTotals = new Map();
   Object.values(costByResource || {}).forEach(rows => {
     (rows || []).forEach(row => {
       const day = row.AnalysisDate;
-      const amount = Number(row.CostAmount);
+      const amount = Number(isPredictedCostRow(row) ? (row.PredictedCost ?? row.CostAmount) : row.CostAmount);
       if (!day || Number.isNaN(amount)) return;
-      totals.set(day, (totals.get(day) || 0) + amount);
+      const bucket = isPredictedCostRow(row) ? predictedTotals : actualTotals;
+      bucket.set(day, (bucket.get(day) || 0) + amount);
     });
   });
-  return [...totals.entries()]
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([AnalysisDate, CostAmount]) => ({AnalysisDate, CostAmount}));
+  for (const day of actualTotals.keys()) predictedTotals.delete(day);
+  return [
+    ...[...actualTotals.entries()].map(([AnalysisDate, CostAmount]) => ({AnalysisDate, CostAmount})),
+    ...[...predictedTotals.entries()].map(([AnalysisDate, CostAmount]) => ({AnalysisDate, CostAmount, PredictedCost: CostAmount, IsPredicted: true, PointType: 'Predicted'})),
+  ].sort((a, b) => String(a.AnalysisDate || '').localeCompare(String(b.AnalysisDate || '')) || (isPredictedCostRow(a) ? 1 : 0) - (isPredictedCostRow(b) ? 1 : 0));
 }
 
 function healthNoDataMessage(azureRecord, mongoRecord, date) {
@@ -115,6 +120,16 @@ function severityColor(sev) {
   return {Critical:'#ff4d6d', High:'#fb923c', Medium:'#fbbf24', Low:'#60a5fa', Normal:'#8a8f98'}[sev] || '#8a8f98';
 }
 function metricColor(i) { return ['#7170ff','#10b981','#f59e0b','#60a5fa','#ff4d6d','#a78bfa','#22d3ee'][i % 7]; }
+const ACTUAL_COST_COLOR = '#7170ff';
+const PREDICTED_COST_COLOR = '#22d3ee';
+function isPredictedCostRow(row) {
+  const marker = String((row && (row.PointType || row.CostType || row.Type)) || '').toLowerCase();
+  return Boolean(row && (row.IsPredicted || row.Predicted || ['predicted', 'forecast', 'forecasted'].includes(marker)));
+}
+function costValue(row) {
+  const value = isPredictedCostRow(row) && row.PredictedCost !== undefined ? row.PredictedCost : row.CostAmount;
+  return Number(value) || 0;
+}
 function fmt(n, digits=2) { return n === null || n === undefined || Number.isNaN(Number(n)) ? '—' : Number(n).toLocaleString(undefined, {maximumFractionDigits: digits}); }
 function shortRid(rid) { return rid && rid.includes('/') ? rid.split('/').filter(Boolean).slice(-1)[0] : rid; }
 function isMongoHealthPayload(payload) {
@@ -154,10 +169,37 @@ function renderMongoPointKpis(timestamp) {
   const kpi = mongoKpiMetaAt(state.lastHealthPayload, timestamp);
   const nsText = kpi.slowQueryNamespaces.length ? kpi.slowQueryNamespaces.slice(0, 6).join(', ') : 'None';
   container.innerHTML = `
-    <div class="health-card"><strong>Selected hour</strong><span class="muted mono">${esc(kpi.timestamp)}</span></div>
-    <div class="health-card"><strong>Tier KPI</strong><span class="muted">${esc(kpi.tier)}</span></div>
-    <div class="health-card"><strong>SlowQueryCount KPI</strong><span class="muted">${fmt(kpi.slowQueryCount, 0)}</span></div>
-    <div class="health-card"><strong>Slow query namespaces</strong><span class="muted">${esc(nsText)}</span></div>`;
+    <div class="health-card"><strong>Selected Hour</strong><span class="muted mono">${esc(kpi.timestamp)}</span></div>
+    <div class="health-card"><strong>Tier</strong><span class="muted">${esc(kpi.tier)}</span></div>
+    <div class="health-card"><strong>SlowQuery Count</strong><span class="muted">${fmt(kpi.slowQueryCount, 0)}</span></div>
+    <div class="health-card"><strong>SlowQuery Namespaces</strong><span class="muted">${esc(nsText)}</span></div>`;
+}
+function renderPointKpis(timestamp) {
+  const container = $('healthSummary');
+  if (!container || !state.lastHealthPayload) return;
+  state.selectedHealthTimestamp = timestamp || null;
+  // update metric cards values
+  const series = (state.lastHealthPayload.series || []).filter(isPlottableHealthSeries);
+  series.forEach((s, i) => {
+    const valueEl = document.getElementById(`metricValue-${i}`);
+    if (!valueEl) return;
+    const descEl = document.getElementById(`metricDesc-${i}`);
+    if (!timestamp) {
+      valueEl.textContent = '';
+      if (descEl && descEl.dataset && descEl.dataset.desc) descEl.textContent = descEl.dataset.desc;
+      return;
+    }
+    // when a timestamp is selected, clear the description to avoid duplicate/leftover strings
+    if (descEl && descEl.dataset) descEl.textContent = '';
+    const match = (s.Points || []).find(p => p.Timestamp === timestamp);
+    if (match && match.Value !== undefined && match.Value !== null && !Number.isNaN(Number(match.Value))) {
+      valueEl.textContent = `${fmt(Number(match.Value))} ${s.Unit || ''}`;
+    } else {
+      valueEl.textContent = '—';
+    }
+  });
+  // also render mongo extra KPIs if applicable
+  if (isMongoHealthPayload(state.lastHealthPayload)) renderMongoPointKpis(timestamp);
 }
 function esc(s) { return String(s ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
 
@@ -323,25 +365,40 @@ function renderCostChart(rows, options = {}) {
   const el = $('costChart');
   if (!rows.length) return showEmpty(el, mode === 'overall' ? 'Overall cost trend is unavailable for this run.' : 'No cost rows for selected resource.');
   const w = Math.max(el.clientWidth || 900, 640), h = 330, m = {l:60,r:22,t:24,b:46};
-  const costs = rows.map(r => Number(r.CostAmount) || 0), minY = Math.min(0, ...costs), maxY = Math.max(...costs) || 1;
-  const x = i => m.l + (rows.length === 1 ? 0.5 : i/(rows.length-1)) * (w-m.l-m.r);
+  const sortedRows = [...rows].sort((a, b) => String(a.AnalysisDate || '').localeCompare(String(b.AnalysisDate || '')) || (isPredictedCostRow(a) ? 1 : 0) - (isPredictedCostRow(b) ? 1 : 0));
+  const costs = sortedRows.map(costValue), minY = Math.min(0, ...costs), maxY = Math.max(...costs) || 1;
+  const x = i => m.l + (sortedRows.length === 1 ? 0.5 : i/(sortedRows.length-1)) * (w-m.l-m.r);
   const y = v => h-m.b - ((v-minY)/(maxY-minY || 1)) * (h-m.t-m.b);
-  const path = rows.map((r,i) => `${i?'L':'M'}${x(i)},${y(Number(r.CostAmount) || 0)}`).join(' ');
+  const indexByRow = new Map(sortedRows.map((r, i) => [r, i]));
+  const actualRows = sortedRows.filter(r => !isPredictedCostRow(r));
+  const predictedRows = sortedRows.filter(isPredictedCostRow);
+  const pathFor = pathRows => pathRows.map((r, i) => `${i?'L':'M'}${x(indexByRow.get(r))},${y(costValue(r))}`).join(' ');
+  const actualPath = pathFor(actualRows);
+  // Start the forecast segment at the final actual point so the overall cost graph remains continuous,
+  // while still using a distinct color for forecast/predicted costs.
+  const predictedPathRows = predictedRows.length && actualRows.length ? [actualRows[actualRows.length - 1], ...predictedRows] : predictedRows;
+  const predictedPath = pathFor(predictedPathRows);
   const yTicks = [0, .25, .5, .75, 1].map(p => minY + p*(maxY-minY));
+  const predictedLegend = predictedRows.length ? `<span class="legend-item"><span class="dot" style="background:${PREDICTED_COST_COLOR}"></span>Predicted cost</span>` : '';
   $('costLegend').innerHTML = mode === 'overall'
-    ? '<span class="legend-item"><span class="dot" style="background:#7170ff"></span>Aggregate CostAmount</span>'
-    : ['Critical','High','Medium','Low','Normal'].map(s => `<span class="legend-item"><span class="dot" style="background:${severityColor(s)}"></span>${s}</span>`).join('');
+    ? `<span class="legend-item"><span class="dot" style="background:${ACTUAL_COST_COLOR}"></span>Actual aggregate CostAmount</span>${predictedLegend}`
+    : ['Critical','High','Medium','Low','Normal'].map(s => `<span class="legend-item"><span class="dot" style="background:${severityColor(s)}"></span>${s}</span>`).join('') + predictedLegend;
   el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
     ${yTicks.map(v => `<line class="grid-line" x1="${m.l}" y1="${y(v)}" x2="${w-m.r}" y2="${y(v)}"></line><text class="axis-text" x="8" y="${y(v)+4}">${fmt(v)}</text>`).join('')}
     <line class="axis" x1="${m.l}" y1="${h-m.b}" x2="${w-m.r}" y2="${h-m.b}"></line>
     <line class="axis" x1="${m.l}" y1="${m.t}" x2="${m.l}" y2="${h-m.b}"></line>
-    <path class="line" d="${path}" stroke="#7170ff"></path>
-    ${rows.map((r,i) => `<circle class="point" data-idx="${i}" cx="${x(i)}" cy="${y(Number(r.CostAmount) || 0)}" r="${mode === 'resource' && r.IsAnomaly?6:4}" fill="${mode === 'overall' ? '#7170ff' : severityColor(r.Severity)}"></circle>`).join('')}
-    ${rows.map((r,i) => (i % Math.ceil(rows.length/9)===0 || i===rows.length-1) ? `<text class="axis-text" x="${x(i)-18}" y="${h-16}">${esc((r.AnalysisDate||'').slice(5))}</text>` : '').join('')}
+    ${actualPath ? `<path class="line actual-cost-line" d="${actualPath}" stroke="${ACTUAL_COST_COLOR}"></path>` : ''}
+    ${predictedPath ? `<path class="line predicted-cost-line" d="${predictedPath}" stroke="${PREDICTED_COST_COLOR}"></path>` : ''}
+    ${sortedRows.map((r,i) => `<circle class="point ${isPredictedCostRow(r) ? 'predicted-point' : 'actual-point'}" data-idx="${i}" cx="${x(i)}" cy="${y(costValue(r))}" r="${isPredictedCostRow(r) ? 4.5 : (mode === 'resource' && r.IsAnomaly?6:4)}" fill="${isPredictedCostRow(r) ? PREDICTED_COST_COLOR : (mode === 'overall' ? ACTUAL_COST_COLOR : severityColor(r.Severity))}"></circle>`).join('')}
+    ${sortedRows.map((r,i) => (i % Math.ceil(sortedRows.length/9)===0 || i===sortedRows.length-1) ? `<text class="axis-text" x="${x(i)-18}" y="${h-16}">${esc((r.AnalysisDate||'').slice(5))}</text>` : '').join('')}
   </svg>`;
   el.querySelectorAll('.point').forEach(pt => {
-    const row = rows[Number(pt.dataset.idx)];
-    if (mode === 'overall') {
+    const row = sortedRows[Number(pt.dataset.idx)];
+    if (isPredictedCostRow(row)) {
+      pt.addEventListener('mouseenter', e => tooltip(e, `<strong>${esc(row.AnalysisDate)}</strong><br/>Predicted cost: ${fmt(row.PredictedCost ?? row.CostAmount)}<br/>${esc(row.ForecastModel || 'Forecast')}`));
+      pt.addEventListener('mouseleave', hideTooltip);
+      pt.addEventListener('click', () => selectPredictedCostPoint(row, mode));
+    } else if (mode === 'overall') {
       pt.addEventListener('mouseenter', e => tooltip(e, `<strong>${esc(row.AnalysisDate)}</strong><br/>Overall cost: ${fmt(row.CostAmount)}<br/>All analyzed resources`));
       pt.addEventListener('mouseleave', hideTooltip);
       pt.addEventListener('click', () => selectOverallCostPoint(row));
@@ -351,6 +408,13 @@ function renderCostChart(rows, options = {}) {
       pt.addEventListener('click', () => selectCostPoint(row));
     }
   });
+}
+
+function selectPredictedCostPoint(row, mode) {
+  const forecastRange = row.ForecastStart && row.ForecastEnd ? ` · Forecast ${esc(row.ForecastStart)} → ${esc(row.ForecastEnd)}` : '';
+  const scope = mode === 'overall' ? 'Overall predicted cost' : 'Resource predicted cost';
+  $('costPointDetail').innerHTML = `<strong>${esc(row.AnalysisDate)}</strong> · ${scope} <strong style="color:${PREDICTED_COST_COLOR}">${fmt(row.PredictedCost ?? row.CostAmount)}</strong>${forecastRange}<br/><span class="muted">Predicted point shown in a different color to bifurcate forecast from actual cost. Health drilldown is available only for actual historical cost points.</span>`;
+  resetHealthDrilldown('Predicted cost points do not have historical health drilldown. Select an actual resource-level cost point to inspect health signals.');
 }
 
 function selectOverallCostPoint(row) {
@@ -408,14 +472,23 @@ function renderHealthChart(payload) {
     if (!s || !p) return;
     pt.addEventListener('mouseenter', e => tooltip(e, `<strong>${esc(p.Timestamp)}</strong><br/>${esc(s.MetricCategory || s.MetricName)}: ${fmt(p.Value)} ${esc(s.Unit || '')}`));
     pt.addEventListener('mouseleave', hideTooltip);
-    pt.addEventListener('click', () => renderMongoPointKpis(p.Timestamp));
+    pt.addEventListener('click', () => renderPointKpis(p.Timestamp));
   });
+  // restore previously-selected timestamp values if any
+  renderPointKpis(state.selectedHealthTimestamp);
 }
 
 function renderHealthSummary(payload) {
   const s = payload.summary || {};
   const series = (payload.series || []).filter(isPlottableHealthSeries);
-  const metricCards = series.length ? series.map((m,i) => `<div class="health-card"><strong style="color:${metricColor(i)}">${esc(m.MetricCategory || m.MetricName)}</strong><span class="muted">${esc(m.MetricName)} · ${esc(m.Unit || 'unit')} · ${(m.Points||[]).length} pts</span></div>`).join('') : '';
+  const metricCards = series.length ? series.map((m,i) => {
+    const desc = `${esc(m.MetricName)} · ${esc(m.Unit || 'unit')} · ${(m.Points||[]).length} pts`;
+    return `
+    <div class="health-card"><strong style="color:${metricColor(i)}">${esc(m.MetricCategory || m.MetricName)}</strong>
+      <span class="muted" id="metricDesc-${i}" data-desc="${esc(desc)}">${esc(desc)}</span>
+      <span class="muted mono" id="metricValue-${i}"></span>
+    </div>`;
+  }).join('') : '';
   const mongoPointKpis = isMongoHealthPayload(payload) ? '<div id="mongoPointKpis" class="mongo-point-kpis" style="grid-column:1/-1"><div class="health-card"><strong>MongoDB point KPIs</strong><span class="muted">Click an hourly MongoDB health point to show Tier and SlowQueryCount for that exact hour.</span></div></div>' : '';
   $('healthSummary').innerHTML = `
     <div class="health-card"><strong>Correlation</strong><span class="muted">${esc(s.CostHealthCorrelation || 'Not Available')}</span></div>
@@ -424,6 +497,8 @@ function renderHealthSummary(payload) {
     ${metricCards}
     ${mongoPointKpis}
     <div class="health-card" style="grid-column:1/-1"><strong>Reason</strong><span class="muted">${esc(s.HealthAnalysisReason || payload.message || 'No health summary available.')}</span></div>`;
+  // populate any selected timestamp values
+  renderPointKpis(state.selectedHealthTimestamp);
 }
 
 let tip;

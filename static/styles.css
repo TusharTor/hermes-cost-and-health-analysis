@@ -116,7 +116,9 @@ svg { width: 100%; height: 100%; min-height: inherit; overflow: visible; }
 .grid-line { stroke-dasharray: 3 5; }
 .axis-text { fill: var(--muted); font-size: 11px; font-family: 'JetBrains Mono', monospace; }
 .line { fill: none; stroke-width: 2.2; }
+.predicted-cost-line { stroke-dasharray: 7 5; stroke-width: 2.6; }
 .point { cursor: pointer; stroke: #08090a; stroke-width: 1.4; }
+.point.predicted-point { stroke: rgba(34,211,238,0.35); stroke-width: 1.8; }
 .point:hover { stroke: white; stroke-width: 2.5; }
 .tooltip { position: fixed; pointer-events: none; background: #191a1b; color: var(--silver); border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-size: 12px; max-width: 360px; z-index: 30; box-shadow: 0 12px 40px rgba(0,0,0,0.45); }
 .legend { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }

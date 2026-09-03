@@ -123,6 +123,57 @@ class DashboardApiTests(unittest.TestCase):
             {"AnalysisDate": "2026-05-02", "CostAmount": 30.0},
         ])
 
+    def test_cost_and_overall_timeseries_append_forecast_predictions(self):
+        ts = "030126_000000"
+        cost_path = self.tmp_path / f"Cost-Analysis_{ts}.json"
+        health_path = self.tmp_path / f"Health-Analysis_{ts}.json"
+        summary_path = self.tmp_path / f"Cost-Health-Summary_{ts}.json"
+        write_json(cost_path, {
+            "CostAnalysis": [
+                {"ResourceID": "rid-a", "ResourceType": "Compute", "AnalysisDate": "2026-05-01", "CostAmount": 10, "Severity": "Normal", "TrendStatus": "Stable"},
+                {"ResourceID": "rid-a", "ResourceType": "Compute", "AnalysisDate": "2026-05-02", "CostAmount": 20, "Severity": "High", "TrendStatus": "Cost Spike"},
+                {"ResourceID": "rid-b", "ResourceType": "Storage", "AnalysisDate": "2026-05-01", "CostAmount": 5, "Severity": "Low", "TrendStatus": "Stable"},
+            ],
+            "Forecast": {
+                "ForecastStart": "2026-05-03",
+                "ForecastEnd": "2026-05-09",
+                "ForecastDays": 7,
+                "Overall": {
+                    "DailyPredictions": [
+                        {"Date": "2026-05-03", "PredictedCost": 31.5},
+                        {"Date": "2026-05-04", "PredictedCost": 32.5},
+                    ],
+                    "Predicted7DayTotal": 220.0,
+                },
+                "AffectedResources": [
+                    {
+                        "ResourceID": "rid-a",
+                        "ForecastModel": "RandomForestRegressor",
+                        "DailyPredictions": [
+                            {"Date": "2026-05-03", "PredictedCost": 22.25},
+                            {"Date": "2026-05-04", "PredictedCost": 23.25},
+                        ],
+                    }
+                ],
+            },
+        })
+        write_json(health_path, [])
+        write_json(summary_path, {"fromDate": "2026-05-01", "toDate": "2026-05-02", "cost_file": str(cost_path), "health_file": str(health_path)})
+
+        resource_rows = dashboard_api.cost_timeseries(self.tmp_path, ts, "rid-a")
+        overall_rows = dashboard_api.overall_cost_timeseries(self.tmp_path, ts)
+
+        self.assertEqual([r["AnalysisDate"] for r in resource_rows], ["2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04"])
+        self.assertEqual([r.get("IsPredicted", False) for r in resource_rows], [False, False, True, True])
+        self.assertEqual(resource_rows[2]["PredictedCost"], 22.25)
+        self.assertEqual(resource_rows[2]["ForecastModel"], "RandomForestRegressor")
+        self.assertEqual(overall_rows, [
+            {"AnalysisDate": "2026-05-01", "CostAmount": 15.0},
+            {"AnalysisDate": "2026-05-02", "CostAmount": 20.0},
+            {"AnalysisDate": "2026-05-03", "CostAmount": 31.5, "PredictedCost": 31.5, "IsPredicted": True, "PointType": "Predicted", "TrendStatus": "Predicted Cost", "Severity": "Normal", "AnalysisReason": "Forecasted cost point generated from the selected-period training data.", "ForecastStart": "2026-05-03", "ForecastEnd": "2026-05-09", "ForecastDays": 7},
+            {"AnalysisDate": "2026-05-04", "CostAmount": 32.5, "PredictedCost": 32.5, "IsPredicted": True, "PointType": "Predicted", "TrendStatus": "Predicted Cost", "Severity": "Normal", "AnalysisReason": "Forecasted cost point generated from the selected-period training data.", "ForecastStart": "2026-05-03", "ForecastEnd": "2026-05-09", "ForecastDays": 7},
+        ])
+
     def test_health_timeseries_prefers_split_azure_file_and_filters_resource_date(self):
         payload = dashboard_api.health_timeseries(self.tmp_path, self.ts, "rid-a", "2026-05-02")
         self.assertEqual(payload["source"], "Azure_Health_Analysis")
