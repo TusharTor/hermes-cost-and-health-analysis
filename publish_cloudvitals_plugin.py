@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import sys
 from pathlib import Path
@@ -14,12 +15,13 @@ sys.path.insert(0, str(ROOT))
 import dashboard_api  # noqa: E402
 
 
-def static_plugin_html() -> str:
+def static_plugin_html(cache_bust: str | None = None) -> str:
     html = (ROOT / 'static' / 'index.html').read_text(encoding='utf-8')
-    html = html.replace('href="/styles.css"', 'href="styles.css"')
-    html = html.replace('src="/app.js"', 'src="app.js"')
+    suffix = f'?v={cache_bust}' if cache_bust else ''
+    html = html.replace('href="/styles.css"', f'href="styles.css{suffix}"')
+    html = html.replace('src="/app.js"', f'src="app.js{suffix}"')
     if 'src="data.js"' not in html:
-        html = html.replace('<script src="app.js"></script>', '<script src="data.js"></script>\n  <script src="app.js"></script>')
+        html = html.replace(f'<script src="app.js{suffix}"></script>', f'<script src="data.js{suffix}"></script>\n  <script src="app.js{suffix}"></script>')
     return html
 
 
@@ -63,15 +65,74 @@ def _group_split_health_series(rows: list[dict], source: str) -> dict[str, list[
     return grouped
 
 
+def _health_kind_for_series(items: list[dict]) -> str:
+    has_mongo = any(
+        any(marker in str(item.get('HealthSource') or '') for marker in ['MongoDB', 'MongoAtlas'])
+        or item.get('MetricCategory') in {'StorageSize', 'IndexSize', 'LongRunningSlowQueries', 'Connections', 'AtlasTier', 'SlowQueryNamespaces'}
+        for item in items
+    )
+    has_azure = any(
+        'Azure' in str(item.get('HealthSource') or '')
+        or item.get('MetricCategory') in {'CPU', 'MemoryUsage', 'Disk', 'Network', 'SNAT', 'TrafficGiB', 'AvgConn', 'SNATPeak'}
+        for item in items
+    )
+    if has_mongo and not has_azure:
+        return 'mongodb'
+    if has_azure and not has_mongo:
+        return 'azure'
+    return 'mixed' if items else None
+
+
+def _source_for_series(items: list[dict]) -> str:
+    kind = _health_kind_for_series(items)
+    if kind == 'mongodb':
+        return 'Mongo_Health_Analysis static shard'
+    if kind == 'azure':
+        return 'Azure_Health_Analysis static shard'
+    return 'Split health analysis static shard'
+
+
+def _minimal_health_coverage(rows: list[dict], source: str) -> dict[str, list[dict]]:
+    """Return compact per-resource coverage metadata for no-data messages.
+
+    The full split health rows can be hundreds of MB because they contain every
+    hourly point. Keep those points out of data.js; retain just enough metadata
+    for the UI to explain why a clicked resource/date has no graph.
+    """
+    coverage: dict[str, list[dict]] = {}
+    for row in rows:
+        rid = row.get('ResourceID')
+        if not rid:
+            continue
+        metric_errors = []
+        for err in row.get('MetricErrors') or []:
+            if isinstance(err, dict):
+                metric_errors.append({k: err.get(k) for k in ['Stage', 'MetricCategory', 'MetricName', 'Error'] if err.get(k) is not None})
+            else:
+                metric_errors.append({'Error': str(err)})
+            if len(metric_errors) >= 3:
+                break
+        coverage.setdefault(rid, []).append({
+            'source': source,
+            'ResourceType': row.get('ResourceType'),
+            'HealthSource': row.get('HealthSource'),
+            'TemporalCoverage': row.get('TemporalCoverage'),
+            'CoverageNote': row.get('CoverageNote'),
+            'MetricErrors': metric_errors,
+            'SnapshotCount': row.get('SnapshotCount'),
+        })
+    return coverage
+
+
 def publish(run_id: str = 'latest') -> dict:
     PLUGIN.mkdir(parents=True, exist_ok=True)
     dist = PLUGIN / 'dist'
     dist.mkdir(parents=True, exist_ok=True)
     for name in ['styles.css', 'app.js']:
         shutil.copyfile(ROOT / 'static' / name, dist / name)
-    (dist / 'cloudvitals.html').write_text(static_plugin_html(), encoding='utf-8')
     run = dashboard_api.get_run(DATA_DIR, run_id)
     resolved = run['run_id']
+    (dist / 'cloudvitals.html').write_text(static_plugin_html(resolved), encoding='utf-8')
     resources = dashboard_api.affected_resources(DATA_DIR, resolved)
     cost = {r['ResourceID']: dashboard_api.cost_timeseries(DATA_DIR, resolved, r['ResourceID']) for r in resources}
     overall_cost = dashboard_api.overall_cost_timeseries(DATA_DIR, resolved)
@@ -97,6 +158,32 @@ def publish(run_id: str = 'latest') -> dict:
         for item in health_items:
             key = f"{item.get('ResourceID')}|{item.get('Date', '')}"
             health_series.setdefault(key, []).append(item)
+    health_dir = dist / 'health' / resolved
+    if health_dir.exists():
+        shutil.rmtree(health_dir)
+    health_dir.mkdir(parents=True, exist_ok=True)
+    health_index: dict[str, dict] = {}
+    for key, items in health_series.items():
+        shard_name = hashlib.sha256(key.encode('utf-8')).hexdigest()[:24] + '.json'
+        shard_rel = f'health/{resolved}/{shard_name}'
+        shard_path = dist / shard_rel
+        payload = {
+            'source': _source_for_series(items),
+            'health_kind': _health_kind_for_series(items),
+            'series': items,
+        }
+        shard_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(',', ':')), encoding='utf-8')
+        health_index[key] = {
+            'file': shard_rel,
+            'source': payload['source'],
+            'health_kind': payload['health_kind'],
+            'series_count': len(items),
+        }
+    health_coverage: dict[str, list[dict]] = {}
+    for rid, items in _minimal_health_coverage(azure_health_rows, 'Azure_Health_Analysis').items():
+        health_coverage.setdefault(rid, []).extend(items)
+    for rid, items in _minimal_health_coverage(mongo_health_rows, 'Mongo_Health_Analysis').items():
+        health_coverage.setdefault(rid, []).extend(items)
     payload = {
         'generated_from': str(DATA_DIR),
         'latest_run_id': resolved,
@@ -106,9 +193,11 @@ def publish(run_id: str = 'latest') -> dict:
         'cost': {resolved: cost},
         'overallCost': {resolved: overall_cost},
         'healthSummary': {resolved: health_summary},
-        'azureHealth': {resolved: azure_health_rows},
-        'mongoHealth': {resolved: mongo_health_rows},
-        'healthSeries': {resolved: health_series},
+        # Keep the initial bundle small. Hourly health graph data is loaded on
+        # demand from per-resource/day static shards instead of eagerly parsing a
+        # 100MB+ JavaScript object during dashboard startup.
+        'healthIndex': {resolved: health_index},
+        'healthCoverage': {resolved: health_coverage},
     }
     data_path = dist / 'data.js'
     data_js = 'window.CLOUDVITALS_STATIC_DATA = ' + json.dumps(payload, ensure_ascii=False, separators=(',', ':')) + ';\n'
@@ -125,6 +214,7 @@ def publish(run_id: str = 'latest') -> dict:
         'cost_points': sum(len(v) for v in cost.values()),
         'overall_cost_points': len(overall_cost),
         'health_series': sum(len(v) for v in health_series.values()),
+        'health_shards': len(health_index),
     }
 
 

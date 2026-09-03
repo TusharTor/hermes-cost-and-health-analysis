@@ -227,9 +227,9 @@ class DashboardApiTests(unittest.TestCase):
             self.assertTrue((plugin / "dist" / "app.js").is_file())
             self.assertTrue((plugin / "dist" / "cloudvitals.html").is_file())
             html = (plugin / "dist" / "cloudvitals.html").read_text(encoding="utf-8")
-            self.assertIn('href="styles.css"', html)
-            self.assertIn('src="data.js"', html)
-            self.assertIn('src="app.js"', html)
+            self.assertIn(f'href="styles.css?v={ts}"', html)
+            self.assertIn(f'src="data.js?v={ts}"', html)
+            self.assertIn(f'src="app.js?v={ts}"', html)
             data_js = (plugin / "dist" / "data.js").read_text(encoding="utf-8")
             payload = json.loads(data_js.removeprefix("window.CLOUDVITALS_STATIC_DATA = ").removesuffix(";\n"))
             self.assertIn("overallCost", payload)
@@ -241,11 +241,19 @@ class DashboardApiTests(unittest.TestCase):
             self.assertIn(ts, payload["resources"])
             self.assertIn(ts, payload["cost"])
             self.assertIn(ts, payload["healthSummary"])
-            self.assertIn(ts, payload["healthSeries"])
-            self.assertIn("azureHealth", payload)
-            self.assertIn("mongoHealth", payload)
-            self.assertEqual(payload["healthSeries"][ts]["rid-a|2026-05-02"][0]["MetricCategory"], "CPU")
-            self.assertEqual(payload["healthSeries"][ts]["rid-b|2026-05-01"][0]["MetricCategory"], "StorageSize")
+            self.assertIn(ts, payload["healthIndex"])
+            self.assertIn(ts, payload["healthCoverage"])
+            self.assertNotIn("azureHealth", payload)
+            self.assertNotIn("mongoHealth", payload)
+            self.assertNotIn("healthSeries", payload)
+            azure_entry = payload["healthIndex"][ts]["rid-a|2026-05-02"]
+            mongo_entry = payload["healthIndex"][ts]["rid-b|2026-05-01"]
+            self.assertEqual(azure_entry["health_kind"], "azure")
+            self.assertEqual(mongo_entry["health_kind"], "mongodb")
+            azure_shard = json.loads((plugin / "dist" / azure_entry["file"]).read_text(encoding="utf-8"))
+            mongo_shard = json.loads((plugin / "dist" / mongo_entry["file"]).read_text(encoding="utf-8"))
+            self.assertEqual(azure_shard["series"][0]["MetricCategory"], "CPU")
+            self.assertEqual(mongo_shard["series"][0]["MetricCategory"], "StorageSize")
 
 
 if __name__ == "__main__":

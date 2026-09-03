@@ -41,7 +41,31 @@ function healthNoDataMessage(azureRecord, mongoRecord, date) {
   return 'No hourly health data was available for this resource/date in Azure_Health_Analysis or Mongo_Health_Analysis. Showing summary-only health status without fabricated graph points.';
 }
 
-function staticApi(path, params = {}) {
+function healthNoDataMessageFromCoverage(coverageRows = [], date) {
+  const selectedDate = date || 'the selected date';
+  const rows = Array.isArray(coverageRows) ? coverageRows : [];
+  const azureRecord = rows.find(r => r && r.source === 'Azure_Health_Analysis');
+  const mongoRecord = rows.find(r => r && r.source === 'Mongo_Health_Analysis');
+  const azureErrors = (azureRecord && azureRecord.MetricErrors) || [];
+  const hasRetentionError = azureRecord && (azureRecord.TemporalCoverage === 'AzureMetricRetentionExpired' || azureErrors.some(e => String((e && e.Error) || '').includes('Max metrics retention period')));
+  if (hasRetentionError) {
+    return `Azure_Health_Analysis contains this resource, but ${selectedDate} is outside Azure Monitor platform metrics retention. No hourly Azure metric graph can be drawn from Azure Monitor for that historical point.`;
+  }
+  if (mongoRecord && mongoRecord.TemporalCoverage === 'HourlySnapshotsUnavailable') {
+    return mongoRecord.CoverageNote || `Mongo_Health_Analysis contains this MongoDB resource, but no command-derived hourly snapshots matched ${selectedDate}. Values were not fabricated or backfilled.`;
+  }
+  const firstError = azureErrors.find(e => e && e.Error);
+  if (firstError) {
+    return `Azure_Health_Analysis contains this resource, but no hourly points matched ${selectedDate} because metric lookup failed: ${firstError.Error}`;
+  }
+  if (rows.length) {
+    const source = rows.map(r => r.source).filter(Boolean).join(' / ') || 'Split health analysis';
+    return `${source} contains this resource, but no hourly points matched ${selectedDate}. Showing summary context without fabricated graph points.`;
+  }
+  return 'No hourly health data was available for this resource/date in Azure_Health_Analysis or Mongo_Health_Analysis. Showing summary-only health status without fabricated graph points.';
+}
+
+async function staticApi(path, params = {}) {
   const data = window.CLOUDVITALS_STATIC_DATA;
   const runId = params.run_id && params.run_id !== 'latest' ? params.run_id : data.latest_run_id;
   if (path === '/api/runs') return data.runs;
@@ -51,22 +75,34 @@ function staticApi(path, params = {}) {
   if (path === '/api/cost') return (data.cost[runId] || {})[params.resource_id] || [];
   if (path === '/api/health') {
     const key = `${params.resource_id}|${params.date || ''}`;
-    const series = ((data.healthSeries[runId] || {})[key]) || [];
+    if (data.healthIndex && data.healthIndex[runId] && data.healthIndex[runId][key]) {
+      const entry = data.healthIndex[runId][key];
+      const res = await fetch(entry.file, {cache: 'no-store'});
+      if (!res.ok) throw new Error(`Health shard failed to load: HTTP ${res.status}`);
+      const shard = await res.json();
+      const series = shard.series || [];
+      const summary = ((data.healthSummary[runId] || {})[params.resource_id]) || null;
+      return {source: shard.source || entry.source || 'Split health analysis static shard', health_kind: shard.health_kind || entry.health_kind || null, run_id: runId, ResourceID: params.resource_id, date: params.date, series, summary, message: series.length ? null : healthNoDataMessageFromCoverage(((data.healthCoverage && data.healthCoverage[runId]) || {})[params.resource_id], params.date)};
+    }
+    const series = ((data.healthSeries && data.healthSeries[runId] || {})[key]) || [];
     const summary = ((data.healthSummary[runId] || {})[params.resource_id]) || null;
-    const hasMongo = series.some(s => String(s.HealthSource || '').includes('MongoDB') || ['StorageSize','IndexSize','LongRunningSlowQueries','Connections'].includes(s.MetricCategory));
+    const hasMongo = series.some(s => ['MongoDB','MongoAtlas'].some(marker => String(s.HealthSource || '').includes(marker)) || ['StorageSize','IndexSize','LongRunningSlowQueries','Connections','AtlasTier','SlowQueryNamespaces'].includes(s.MetricCategory));
     const hasAzure = series.some(s => String(s.HealthSource || '').includes('Azure') || ['CPU','MemoryUsage','Disk','Network','SNAT','TrafficGiB','AvgConn','SNATPeak'].includes(s.MetricCategory));
     const mongoRecord = ((data.mongoHealth && data.mongoHealth[runId]) || []).find(r => r.ResourceID === params.resource_id);
     const azureRecord = ((data.azureHealth && data.azureHealth[runId]) || []).find(r => r.ResourceID === params.resource_id);
+    const coverageRows = ((data.healthCoverage && data.healthCoverage[runId]) || {})[params.resource_id] || [];
     const hasMongoRecord = Boolean(mongoRecord);
     const hasAzureRecord = Boolean(azureRecord);
-    const source = hasMongo && !hasAzure ? 'Mongo_Health_Analysis static snapshot' : (hasAzure && !hasMongo ? 'Azure_Health_Analysis static snapshot' : (hasMongoRecord ? 'Mongo_Health_Analysis static snapshot' : (hasAzureRecord ? 'Azure_Health_Analysis static snapshot' : (series.length ? 'Split health analysis static snapshot' : 'Health-Analysis summary'))));
-    const health_kind = hasMongo && !hasAzure ? 'mongodb' : (hasAzure && !hasMongo ? 'azure' : (hasMongoRecord ? 'mongodb' : (hasAzureRecord ? 'azure' : (series.length ? 'mixed' : null))));
-    return {source, health_kind, run_id: runId, ResourceID: params.resource_id, date: params.date, series, summary, message: series.length ? null : healthNoDataMessage(azureRecord, mongoRecord, params.date)};
+    const hasCoverageMongo = coverageRows.some(r => r && r.source === 'Mongo_Health_Analysis');
+    const hasCoverageAzure = coverageRows.some(r => r && r.source === 'Azure_Health_Analysis');
+    const source = hasMongo && !hasAzure ? 'Mongo_Health_Analysis static snapshot' : (hasAzure && !hasMongo ? 'Azure_Health_Analysis static snapshot' : (hasMongoRecord || hasCoverageMongo ? 'Mongo_Health_Analysis static snapshot' : (hasAzureRecord || hasCoverageAzure ? 'Azure_Health_Analysis static snapshot' : (series.length ? 'Split health analysis static snapshot' : 'Health-Analysis summary'))));
+    const health_kind = hasMongo && !hasAzure ? 'mongodb' : (hasAzure && !hasMongo ? 'azure' : (hasMongoRecord || hasCoverageMongo ? 'mongodb' : (hasAzureRecord || hasCoverageAzure ? 'azure' : (series.length ? 'mixed' : null))));
+    return {source, health_kind, run_id: runId, ResourceID: params.resource_id, date: params.date, series, summary, message: series.length ? null : (coverageRows.length ? healthNoDataMessageFromCoverage(coverageRows, params.date) : healthNoDataMessage(azureRecord, mongoRecord, params.date))};
   }
   throw new Error(`Unknown static API path: ${path}`);
 }
 const api = async (path, params = {}) => {
-  if (window.CLOUDVITALS_STATIC_DATA) return staticApi(path, params);
+  if (window.CLOUDVITALS_STATIC_DATA) return await staticApi(path, params);
   const url = new URL(`${APP_BASE}${path}`, window.location.origin);
   for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== null) url.searchParams.set(k, v);
   const res = await fetch(url);
