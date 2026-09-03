@@ -1,7 +1,8 @@
 const state = {
   runs: [], runId: null, summary: null, resources: [], filtered: [], selectedResource: null,
   overallCostByRun: {}, selectedSeverity: 'all', healthMode: 'raw', lastHealthPayload: null,
-  followLatest: true, lastLoadedAt: null, refreshTimer: null
+  followLatest: true, lastLoadedAt: null, refreshTimer: null,
+  selectedHealthTimestamp: null
 };
 
 const LIVE_REFRESH_MS = 60_000;
@@ -154,10 +155,37 @@ function renderMongoPointKpis(timestamp) {
   const kpi = mongoKpiMetaAt(state.lastHealthPayload, timestamp);
   const nsText = kpi.slowQueryNamespaces.length ? kpi.slowQueryNamespaces.slice(0, 6).join(', ') : 'None';
   container.innerHTML = `
-    <div class="health-card"><strong>Selected hour</strong><span class="muted mono">${esc(kpi.timestamp)}</span></div>
-    <div class="health-card"><strong>Tier KPI</strong><span class="muted">${esc(kpi.tier)}</span></div>
-    <div class="health-card"><strong>SlowQueryCount KPI</strong><span class="muted">${fmt(kpi.slowQueryCount, 0)}</span></div>
-    <div class="health-card"><strong>Slow query namespaces</strong><span class="muted">${esc(nsText)}</span></div>`;
+    <div class="health-card"><strong>Selected Hour</strong><span class="muted mono">${esc(kpi.timestamp)}</span></div>
+    <div class="health-card"><strong>Tier</strong><span class="muted">${esc(kpi.tier)}</span></div>
+    <div class="health-card"><strong>SlowQuery Count</strong><span class="muted">${fmt(kpi.slowQueryCount, 0)}</span></div>
+    <div class="health-card"><strong>SlowQuery Namespaces</strong><span class="muted">${esc(nsText)}</span></div>`;
+}
+function renderPointKpis(timestamp) {
+  const container = $('healthSummary');
+  if (!container || !state.lastHealthPayload) return;
+  state.selectedHealthTimestamp = timestamp || null;
+  // update metric cards values
+  const series = (state.lastHealthPayload.series || []).filter(isPlottableHealthSeries);
+  series.forEach((s, i) => {
+    const valueEl = document.getElementById(`metricValue-${i}`);
+    if (!valueEl) return;
+    const descEl = document.getElementById(`metricDesc-${i}`);
+    if (!timestamp) {
+      valueEl.textContent = '';
+      if (descEl && descEl.dataset && descEl.dataset.desc) descEl.textContent = descEl.dataset.desc;
+      return;
+    }
+    // when a timestamp is selected, clear the description to avoid duplicate/leftover strings
+    if (descEl && descEl.dataset) descEl.textContent = '';
+    const match = (s.Points || []).find(p => p.Timestamp === timestamp);
+    if (match && match.Value !== undefined && match.Value !== null && !Number.isNaN(Number(match.Value))) {
+      valueEl.textContent = `${fmt(Number(match.Value))} ${s.Unit || ''}`;
+    } else {
+      valueEl.textContent = '—';
+    }
+  });
+  // also render mongo extra KPIs if applicable
+  if (isMongoHealthPayload(state.lastHealthPayload)) renderMongoPointKpis(timestamp);
 }
 function esc(s) { return String(s ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
 
@@ -408,14 +436,23 @@ function renderHealthChart(payload) {
     if (!s || !p) return;
     pt.addEventListener('mouseenter', e => tooltip(e, `<strong>${esc(p.Timestamp)}</strong><br/>${esc(s.MetricCategory || s.MetricName)}: ${fmt(p.Value)} ${esc(s.Unit || '')}`));
     pt.addEventListener('mouseleave', hideTooltip);
-    pt.addEventListener('click', () => renderMongoPointKpis(p.Timestamp));
+    pt.addEventListener('click', () => renderPointKpis(p.Timestamp));
   });
+  // restore previously-selected timestamp values if any
+  renderPointKpis(state.selectedHealthTimestamp);
 }
 
 function renderHealthSummary(payload) {
   const s = payload.summary || {};
   const series = (payload.series || []).filter(isPlottableHealthSeries);
-  const metricCards = series.length ? series.map((m,i) => `<div class="health-card"><strong style="color:${metricColor(i)}">${esc(m.MetricCategory || m.MetricName)}</strong><span class="muted">${esc(m.MetricName)} · ${esc(m.Unit || 'unit')} · ${(m.Points||[]).length} pts</span></div>`).join('') : '';
+  const metricCards = series.length ? series.map((m,i) => {
+    const desc = `${esc(m.MetricName)} · ${esc(m.Unit || 'unit')} · ${(m.Points||[]).length} pts`;
+    return `
+    <div class="health-card"><strong style="color:${metricColor(i)}">${esc(m.MetricCategory || m.MetricName)}</strong>
+      <span class="muted" id="metricDesc-${i}" data-desc="${esc(desc)}">${esc(desc)}</span>
+      <span class="muted mono" id="metricValue-${i}"></span>
+    </div>`;
+  }).join('') : '';
   const mongoPointKpis = isMongoHealthPayload(payload) ? '<div id="mongoPointKpis" class="mongo-point-kpis" style="grid-column:1/-1"><div class="health-card"><strong>MongoDB point KPIs</strong><span class="muted">Click an hourly MongoDB health point to show Tier and SlowQueryCount for that exact hour.</span></div></div>' : '';
   $('healthSummary').innerHTML = `
     <div class="health-card"><strong>Correlation</strong><span class="muted">${esc(s.CostHealthCorrelation || 'Not Available')}</span></div>
@@ -424,6 +461,8 @@ function renderHealthSummary(payload) {
     ${metricCards}
     ${mongoPointKpis}
     <div class="health-card" style="grid-column:1/-1"><strong>Reason</strong><span class="muted">${esc(s.HealthAnalysisReason || payload.message || 'No health summary available.')}</span></div>`;
+  // populate any selected timestamp values
+  renderPointKpis(state.selectedHealthTimestamp);
 }
 
 let tip;
