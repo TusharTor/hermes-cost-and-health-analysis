@@ -35,8 +35,12 @@ def make_fixture(tmp_path: Path):
     ]
     azure_rows = [
         {"ResourceID": "rid-a", "ResourceType": "Microsoft.Compute/virtualMachines", "HealthSource": "AzureMonitor", "Metrics": {
-            "CPU": [{"Timestamp": "2026-05-02T00:00:00Z", "Value": 44, "Unit": "Percent", "MetricName": "Percentage CPU", "Aggregation": "Average"}],
-            "MemoryUsage": [{"Timestamp": "2026-05-02T00:00:00Z", "Value": 1024, "Unit": "Bytes", "MetricName": "Available Memory Bytes", "Aggregation": "Average"}],
+            "CPU": [{"Timestamp": "2026-05-02T00:00:00Z", "Value": 44, "Unit": "Percent", "MetricName": "Percentage CPU", "Aggregation": "Average", "Granularity": "PT1H"}],
+            "MemoryUsage": [{"Timestamp": "2026-05-02T00:00:00Z", "Value": 1024, "Unit": "Bytes", "MetricName": "Available Memory Bytes", "Aggregation": "Average", "Granularity": "PT1H"}],
+            "Disk": [], "IOPs": [], "Network": [], "SNAT": []
+        }, "OverviewMetrics": {
+            "CPU": [{"Timestamp": "2026-05-01T00:00:00Z", "Value": 40, "Unit": "Percent", "MetricName": "Percentage CPU", "Aggregation": "Average", "Granularity": "PT6H"}, {"Timestamp": "2026-05-02T00:00:00Z", "Value": 44, "Unit": "Percent", "MetricName": "Percentage CPU", "Aggregation": "Average", "Granularity": "PT6H"}],
+            "MemoryUsage": [{"Timestamp": "2026-05-01T00:00:00Z", "Value": 900, "Unit": "Bytes", "MetricName": "Available Memory Bytes", "Aggregation": "Average", "Granularity": "PT6H"}, {"Timestamp": "2026-05-02T00:00:00Z", "Value": 1024, "Unit": "Bytes", "MetricName": "Available Memory Bytes", "Aggregation": "Average", "Granularity": "PT6H"}],
             "Disk": [], "IOPs": [], "Network": [], "SNAT": []
         }}
     ]
@@ -123,12 +127,94 @@ class DashboardApiTests(unittest.TestCase):
             {"AnalysisDate": "2026-05-02", "CostAmount": 30.0},
         ])
 
+    def test_cost_and_overall_timeseries_append_forecast_predictions(self):
+        ts = "030126_000000"
+        cost_path = self.tmp_path / f"Cost-Analysis_{ts}.json"
+        health_path = self.tmp_path / f"Health-Analysis_{ts}.json"
+        summary_path = self.tmp_path / f"Cost-Health-Summary_{ts}.json"
+        write_json(cost_path, {
+            "CostAnalysis": [
+                {"ResourceID": "rid-a", "ResourceType": "Compute", "AnalysisDate": "2026-05-01", "CostAmount": 10, "Severity": "Normal", "TrendStatus": "Stable"},
+                {"ResourceID": "rid-a", "ResourceType": "Compute", "AnalysisDate": "2026-05-02", "CostAmount": 20, "Severity": "High", "TrendStatus": "Cost Spike"},
+                {"ResourceID": "rid-b", "ResourceType": "Storage", "AnalysisDate": "2026-05-01", "CostAmount": 5, "Severity": "Low", "TrendStatus": "Stable"},
+            ],
+            "Forecast": {
+                "ForecastStart": "2026-05-03",
+                "ForecastEnd": "2026-05-09",
+                "ForecastDays": 7,
+                "Overall": {
+                    "DailyPredictions": [
+                        {"Date": "2026-05-03", "PredictedCost": 31.5},
+                        {"Date": "2026-05-04", "PredictedCost": 32.5},
+                    ],
+                    "Predicted7DayTotal": 220.0,
+                },
+                "AffectedResources": [
+                    {
+                        "ResourceID": "rid-a",
+                        "ForecastModel": "RandomForestRegressor",
+                        "DailyPredictions": [
+                            {"Date": "2026-05-03", "PredictedCost": 22.25},
+                            {"Date": "2026-05-04", "PredictedCost": 23.25},
+                        ],
+                    }
+                ],
+            },
+        })
+        write_json(health_path, [])
+        write_json(summary_path, {"fromDate": "2026-05-01", "toDate": "2026-05-02", "cost_file": str(cost_path), "health_file": str(health_path)})
+
+        resource_rows = dashboard_api.cost_timeseries(self.tmp_path, ts, "rid-a")
+        overall_rows = dashboard_api.overall_cost_timeseries(self.tmp_path, ts)
+
+        self.assertEqual([r["AnalysisDate"] for r in resource_rows], ["2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04"])
+        self.assertEqual([r.get("IsPredicted", False) for r in resource_rows], [False, False, True, True])
+        self.assertEqual(resource_rows[2]["PredictedCost"], 22.25)
+        self.assertEqual(resource_rows[2]["ForecastModel"], "RandomForestRegressor")
+        self.assertEqual(overall_rows, [
+            {"AnalysisDate": "2026-05-01", "CostAmount": 15.0},
+            {"AnalysisDate": "2026-05-02", "CostAmount": 20.0},
+            {"AnalysisDate": "2026-05-03", "CostAmount": 31.5, "PredictedCost": 31.5, "IsPredicted": True, "PointType": "Predicted", "TrendStatus": "Predicted Cost", "Severity": "Normal", "AnalysisReason": "Forecasted cost point generated from the selected-period training data.", "ForecastStart": "2026-05-03", "ForecastEnd": "2026-05-09", "ForecastDays": 7},
+            {"AnalysisDate": "2026-05-04", "CostAmount": 32.5, "PredictedCost": 32.5, "IsPredicted": True, "PointType": "Predicted", "TrendStatus": "Predicted Cost", "Severity": "Normal", "AnalysisReason": "Forecasted cost point generated from the selected-period training data.", "ForecastStart": "2026-05-03", "ForecastEnd": "2026-05-09", "ForecastDays": 7},
+        ])
+
     def test_health_timeseries_prefers_split_azure_file_and_filters_resource_date(self):
         payload = dashboard_api.health_timeseries(self.tmp_path, self.ts, "rid-a", "2026-05-02")
         self.assertEqual(payload["source"], "Azure_Health_Analysis")
         self.assertEqual(payload["health_kind"], "azure")
         self.assertEqual([s["MetricCategory"] for s in payload["series"]], ["CPU", "MemoryUsage"])
         self.assertEqual(payload["series"][0]["Points"][0]["Value"], 44)
+
+    def test_health_timeseries_without_date_returns_resource_overview(self):
+        write_json(self.tmp_path / f"Azure_Health_Analysis_{self.ts}.json", [{
+            "ResourceID": "rid-a",
+            "ResourceType": "Microsoft.Compute/virtualMachines",
+            "HealthSource": "AzureMonitor",
+            "Metrics": {
+                "CPU": [
+                    {"Timestamp": "2026-05-01T00:00:00Z", "Value": 21, "Unit": "Percent", "MetricName": "Percentage CPU", "Aggregation": "Average", "Granularity": "PT1H"},
+                    {"Timestamp": "2026-05-01T01:00:00Z", "Value": 44, "Unit": "Percent", "MetricName": "Percentage CPU", "Aggregation": "Average", "Granularity": "PT1H"},
+                ],
+                "MemoryUsage": [], "Disk": [], "IOPs": [], "Network": [], "SNAT": []
+            },
+            "OverviewMetrics": {
+                "CPU": [
+                    {"Timestamp": "2026-05-01T00:00:00Z", "Value": 30, "Unit": "Percent", "MetricName": "Percentage CPU", "Aggregation": "Average", "Granularity": "PT6H"},
+                    {"Timestamp": "2026-05-02T00:00:00Z", "Value": 44, "Unit": "Percent", "MetricName": "Percentage CPU", "Aggregation": "Average", "Granularity": "PT6H"},
+                ],
+                "MemoryUsage": [], "Disk": [], "IOPs": [], "Network": [], "SNAT": []
+            },
+        }])
+
+        payload = dashboard_api.health_timeseries(self.tmp_path, self.ts, "rid-a", None, "PT6H")
+
+        self.assertEqual(payload["granularity"], "PT6H")
+        self.assertEqual(payload["source"], "Azure_Health_Analysis")
+        self.assertEqual(payload["series"][0]["Date"], None)
+        self.assertEqual(payload["series"][0]["Granularity"], "PT6H")
+        self.assertEqual([p["Timestamp"] for p in payload["series"][0]["Points"]], ["2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z"])
+        self.assertEqual(payload["series"][0]["Points"][0]["Value"], 30)
+        self.assertNotIn("DailyPointCount", payload["series"][0]["Points"][0])
 
     def test_health_timeseries_uses_split_mongo_file_for_mongo_resource_date(self):
         payload = dashboard_api.health_timeseries(self.tmp_path, self.ts, "rid-b", "2026-05-01")
@@ -196,6 +282,41 @@ class DashboardApiTests(unittest.TestCase):
         self.assertEqual(payload["series"], [])
         self.assertIn("0 usable series", payload["message"])
 
+    def test_run_discovery_sorts_ddmmyy_run_ids_chronologically(self):
+        write_json(self.tmp_path / "Cost-Analysis_310826_124545.json", [])
+        write_json(self.tmp_path / "Health-Analysis_310826_124545.json", [])
+        write_json(self.tmp_path / "Cost-Health-Summary_310826_124545.json", {"cost_file": str(self.tmp_path / "Cost-Analysis_310826_124545.json"), "health_file": str(self.tmp_path / "Health-Analysis_310826_124545.json")})
+        write_json(self.tmp_path / "Cost-Analysis_030926_133405.json", [])
+        write_json(self.tmp_path / "Health-Analysis_030926_133405.json", [])
+        write_json(self.tmp_path / "Cost-Health-Summary_030926_133405.json", {"cost_file": str(self.tmp_path / "Cost-Analysis_030926_133405.json"), "health_file": str(self.tmp_path / "Health-Analysis_030926_133405.json")})
+
+        runs = dashboard_api.discover_runs(self.tmp_path)
+
+        self.assertEqual(runs[0]["run_id"], "030926_133405")
+        self.assertGreater([r["run_id"] for r in runs].index("310826_124545"), [r["run_id"] for r in runs].index("030926_133405"))
+
+    def test_script_schedule_context_matches_mongodb_health_hour(self):
+        platform_file = self.tmp_path / "platform_scripts.txt"
+        piaggio_file = self.tmp_path / "piaggio_scripts.txt"
+        platform_file.write_text("| `DailyScript.py` | Daily at 7:30am |\n| `HourlyScript.py` | Hourly, on the hour |\n", encoding="utf-8")
+        piaggio_file.write_text("| `PiaggioHalfHourly` | Every 30 minutes |\n", encoding="utf-8")
+        old_files = dashboard_api.SCRIPT_SCHEDULE_FILES
+        try:
+            dashboard_api.SCRIPT_SCHEDULE_FILES = {"Platform_MongoDb": platform_file, "Piaggio_MongoDb": piaggio_file}
+            ctx = dashboard_api.script_schedule_context_for_mongo_point(
+                {"ResourceID": "Platform_MongoDb", "MongoDBResourceID": "Cluster_Platform"},
+                "2026-09-03T07:00:00Z",
+            )
+        finally:
+            dashboard_api.SCRIPT_SCHEDULE_FILES = old_files
+
+        self.assertEqual(ctx["status"], "Available")
+        self.assertEqual([s["script_name"] for s in ctx["scheduled_scripts"]], ["DailyScript.py", "HourlyScript.py"])
+        self.assertEqual(ctx["scheduled_scripts"][0]["scheduled_slots"], ["07:30"])
+        self.assertNotIn("observed_cronicle_jobs", ctx)
+        self.assertNotIn("observed_status", ctx)
+        self.assertIn("Supporting context only", ctx["note"])
+
     def test_prefixed_route_normalization_for_tor_ops_agent_dashboard(self):
         self.assertEqual(dashboard_api.normalize_request_path("/tor-ops-agent/dashboard"), ("/index.html", True))
         self.assertEqual(dashboard_api.normalize_request_path("/tor-ops-agent/dashboard/"), ("/index.html", True))
@@ -250,14 +371,29 @@ class DashboardApiTests(unittest.TestCase):
             self.assertNotIn("mongoHealth", payload)
             self.assertNotIn("healthSeries", payload)
             azure_entry = payload["healthIndex"][ts]["rid-a|2026-05-02"]
+            azure_overview_entry = payload["healthIndex"][ts]["rid-a|"]
             mongo_entry = payload["healthIndex"][ts]["rid-b|2026-05-01"]
+            mongo_overview_entry = payload["healthIndex"][ts]["rid-b|"]
             self.assertEqual(azure_entry["health_kind"], "azure")
+            self.assertEqual(azure_overview_entry["health_kind"], "azure")
             self.assertEqual(mongo_entry["health_kind"], "mongodb")
+            self.assertEqual(mongo_overview_entry["health_kind"], "mongodb")
             azure_shard = json.loads((plugin / "dist" / azure_entry["file"]).read_text(encoding="utf-8"))
+            azure_overview_shard = json.loads((plugin / "dist" / azure_overview_entry["file"]).read_text(encoding="utf-8"))
             mongo_shard = json.loads((plugin / "dist" / mongo_entry["file"]).read_text(encoding="utf-8"))
+            mongo_overview_shard = json.loads((plugin / "dist" / mongo_overview_entry["file"]).read_text(encoding="utf-8"))
             self.assertEqual(azure_shard["series"][0]["MetricCategory"], "CPU")
+            self.assertEqual(azure_overview_shard["series"][0]["Granularity"], "PT6H")
+            self.assertEqual(len(azure_overview_shard["series"][0]["Points"]), 2)
+            self.assertEqual(azure_overview_shard["series"][0]["Points"][0]["Granularity"], "PT6H")
+            self.assertEqual(azure_overview_shard["series"][0]["Points"][0]["Aggregation"], "Average")
+            self.assertNotIn("DailyAverage", azure_overview_shard["series"][0]["Points"][0])
             self.assertEqual([s["MetricCategory"] for s in mongo_shard["series"]], ["Connections", "MemoryUsage", "StorageSize"])
             self.assertEqual(mongo_shard["series"][0]["Points"][0]["Tier"], "M50")
+            self.assertEqual([s["MetricCategory"] for s in mongo_overview_shard["series"]], ["Connections", "MemoryUsage", "StorageSize"])
+            self.assertEqual(mongo_overview_shard["series"][0]["Granularity"], "PT6H")
+            self.assertEqual(mongo_overview_shard["series"][0]["Points"][0]["Granularity"], "PT6H")
+            self.assertIn("BucketAverage", mongo_overview_shard["series"][0]["Points"][0])
 
 
 if __name__ == "__main__":

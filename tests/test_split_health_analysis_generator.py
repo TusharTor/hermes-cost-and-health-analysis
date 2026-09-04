@@ -88,6 +88,35 @@ class SplitHealthAnalysisGeneratorTests(unittest.TestCase):
         profile = gen.azure_credential_profiles(creds)[0]
         self.assertEqual(profile["ProfileName"], "AzureAd")
         self.assertEqual(profile["tenant_id"], "tenant-a")
+    def test_choose_azure_metrics_prefers_percentage_cpu_and_memory(self):
+        defs = [
+            {"name": {"value": "CpuTime"}, "unit": "Seconds", "primaryAggregationType": "Total"},
+            {"name": {"value": "CpuPercentage"}, "unit": "Percent", "primaryAggregationType": "Average"},
+            {"name": {"value": "MemoryWorkingSet"}, "unit": "Bytes", "primaryAggregationType": "Average"},
+            {"name": {"value": "MemoryPercentage"}, "unit": "Percent", "primaryAggregationType": "Average"},
+        ]
+        chosen = gen.choose_azure_metrics(defs, per_category=1)
+        self.assertEqual(chosen["CPU"][0]["MetricName"], "CpuPercentage")
+        self.assertEqual(chosen["MemoryUsage"][0]["MetricName"], "MemoryPercentage")
+
+    def test_query_metric_can_call_pt6h_average_only(self):
+        captured = {}
+        def fake_http_json(method, url, headers=None, data=None, timeout=45):
+            captured['url'] = url
+            return {"value": [{"unit": "Percent", "timeseries": [{"data": [{"timeStamp": "2026-08-01T00:00:00Z", "average": 42.5}]}]}]}
+        old_http_json = gen.http_json
+        try:
+            gen.http_json = fake_http_json
+            points, err = gen.query_metric("/subscriptions/s/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm", "Percentage CPU", "token", "2026-08-01", "2026-08-31", preferred_aggregation="Average", interval="PT6H", aggregation_param="Average")
+        finally:
+            gen.http_json = old_http_json
+
+        self.assertIsNone(err)
+        self.assertIn("interval=PT6H", captured['url'])
+        self.assertIn("aggregation=Average", captured['url'])
+        self.assertEqual(points[0]["Aggregation"], "Average")
+        self.assertEqual(points[0]["Granularity"], "PT6H")
+        self.assertEqual(points[0]["Value"], 42.5)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ class Element {
     this.classList = new ClassList();
     this._innerHTML = '';
     this._textContent = '';
+    this.children = [];
   }
   set innerHTML(value) {
     this._innerHTML = String(value || '');
@@ -36,10 +37,20 @@ class Element {
       this.childrenBySelector.set('.resource-row', rows);
     }
     if (this.id === 'costChart') {
-      const points = [...this._innerHTML.matchAll(/<circle class="point" data-idx="(\d+)"/g)].map(match => {
+      const points = [...this._innerHTML.matchAll(/<circle class="([^"]*\bpoint\b[^"]*)" data-idx="(\d+)"/g)].map(match => {
         const point = new Element();
-        point.classList = new ClassList('point');
-        point.dataset.idx = match[1];
+        point.classList = new ClassList(match[1]);
+        point.dataset.idx = match[2];
+        return point;
+      });
+      this.childrenBySelector.set('.point', points);
+    }
+    if (this.id === 'healthChart') {
+      const points = [...this._innerHTML.matchAll(/<circle class="([^"]*\bpoint\b[^"]*)" data-si="(\d+)" data-pi="(\d+)"/g)].map(match => {
+        const point = new Element();
+        point.classList = new ClassList(match[1]);
+        point.dataset.si = match[2];
+        point.dataset.pi = match[3];
         return point;
       });
       this.childrenBySelector.set('.point', points);
@@ -51,6 +62,8 @@ class Element {
   addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
   querySelectorAll(selector) { return this.childrenBySelector.get(selector) || []; }
   dispatch(type, event = {}) { (this.listeners[type] || []).forEach(fn => fn({preventDefault(){}, ...event})); }
+  appendChild(child) { this.children.push(child); return child; }
+  remove() {}
 }
 
 function decodeEntities(value) {
@@ -82,7 +95,7 @@ function makeHarness() {
     document: {
       body: new Element('body'),
       createElement: () => new Element(),
-      getElementById: id => elements[id],
+      getElementById: id => elements[id] || (elements[id] = new Element(id)),
       querySelectorAll: selector => {
         if (selector === '[data-severity]') return severityButtons;
         if (selector === '.resource-row') return elements.resourceList.querySelectorAll('.resource-row');
@@ -99,7 +112,7 @@ function makeHarness() {
           {run_id: 'run2', fromDate: '2026-09-01', toDate: '2026-09-02', files: {}, has_health_timeseries: false}
         ],
         summaries: {
-          run1: {run_id: 'run1', fromDate: '2026-08-01', toDate: '2026-08-02', resource_count: 2, affected_resource_count: 2, cost_anomaly_records: 1, health_analysis_records: 1, health_records_with_unavailable_metrics: 0, health_timeseries_series_count: 1, has_health_timeseries: true},
+          run1: {run_id: 'run1', fromDate: '2026-08-01', toDate: '2026-08-02', resource_count: 2, affected_resource_count: 2, cost_anomaly_records: 1, health_analysis_records: 1, health_records_with_unavailable_metrics: 0, health_timeseries_series_count: 1, has_health_timeseries: true, prompt_range_total_cost: 999.99},
           run2: {run_id: 'run2', fromDate: '2026-09-01', toDate: '2026-09-02', resource_count: 1, affected_resource_count: 1, cost_anomaly_records: 0, health_analysis_records: 0, health_records_with_unavailable_metrics: 0, has_health_timeseries: false}
         },
         resources: {
@@ -113,7 +126,8 @@ function makeHarness() {
           run1: {
             'resource-a': [
               {ResourceID: 'resource-a', AnalysisDate: '2026-08-01', CostAmount: 100, Severity: 'Normal', IsAnomaly: false, TrendStatus: 'Stable', AnalysisReason: 'normal'},
-              {ResourceID: 'resource-a', AnalysisDate: '2026-08-02', CostAmount: 200, Severity: 'High', IsAnomaly: true, TrendStatus: 'Cost Spike', AnalysisReason: 'spike'}
+              {ResourceID: 'resource-a', AnalysisDate: '2026-08-02', CostAmount: 200, Severity: 'High', IsAnomaly: true, TrendStatus: 'Cost Spike', AnalysisReason: 'spike'},
+              {ResourceID: 'resource-a', AnalysisDate: '2026-08-03', CostAmount: 225, PredictedCost: 225, IsPredicted: true, PointType: 'Predicted', ForecastModel: 'RandomForestRegressor', ForecastStart: '2026-08-03', ForecastEnd: '2026-08-09'}
             ],
             'resource-b': [
               {ResourceID: 'resource-b', AnalysisDate: '2026-08-01', CostAmount: 50, Severity: 'Low', IsAnomaly: false, TrendStatus: 'Stable', AnalysisReason: 'normal'},
@@ -123,7 +137,11 @@ function makeHarness() {
           run2: {'resource-c': [{ResourceID: 'resource-c', AnalysisDate: '2026-09-01', CostAmount: 9, Severity: 'Medium', IsAnomaly: false, TrendStatus: 'Stable', AnalysisReason: 'normal'}]}
         },
         overallCost: {
-          run1: [{AnalysisDate: '2026-08-01', CostAmount: 150}, {AnalysisDate: '2026-08-02', CostAmount: 275}],
+          run1: [
+            {AnalysisDate: '2026-08-01', CostAmount: 150},
+            {AnalysisDate: '2026-08-02', CostAmount: 275},
+            {AnalysisDate: '2026-08-03', CostAmount: 305, PredictedCost: 305, IsPredicted: true, PointType: 'Predicted', ForecastModel: 'RandomForestRegressor', ForecastStart: '2026-08-03', ForecastEnd: '2026-08-09'}
+          ],
           run2: [{AnalysisDate: '2026-09-01', CostAmount: 9}]
         },
         healthSummary: {run1: {'resource-a': {CostHealthCorrelation: 'No Clear Correlation', OverallHealthStatus: 'Healthy', HealthAnalysisReason: 'ok'}}},
@@ -147,8 +165,16 @@ async function flush() { await Promise.resolve(); await Promise.resolve(); await
   assert.strictEqual(vm.runInContext('state.selectedResource', context), null, 'initial load should not select a resource');
   assert.strictEqual(elements.costChartTitle.textContent, 'Overall cost trend');
   assert.strictEqual(elements.costChartSubtitle.textContent, 'All analyzed resources');
+  assert.doesNotMatch(elements.runMeta.innerHTML, /Mode|Run ID|Hourly health|Data dir/i, 'removed hero metadata cards should not render');
+  assert.match(elements.runMeta.innerHTML, /Date range/i, 'date range metadata should remain');
+  assert.match(elements.runMeta.innerHTML, /Last loaded/i, 'last loaded metadata should remain');
+  assert.match(elements.summaryCards.innerHTML, /Total cost/i, 'Affected summary card should be replaced by Total cost');
+  assert.match(elements.summaryCards.innerHTML, /999\.99/, 'Total cost should use prompt_range_total_cost from all source resource CostAmount in the requested fromDate/toDate range');
+  assert.doesNotMatch(elements.summaryCards.innerHTML, /Affected|Cost anomalies/i, 'removed lower summary cards should not render');
   assert.strictEqual(elements.resourceList.querySelectorAll('.resource-row').filter(r => r.classList.contains('active')).length, 0);
-  assert.strictEqual(elements.costChart.querySelectorAll('.point').length, 2, 'overall chart should render aggregate points');
+  assert.strictEqual(elements.costChart.querySelectorAll('.point').length, 3, 'overall chart should render aggregate actual + predicted points');
+  assert.match(elements.costChart.innerHTML, /predicted-cost-line/, 'overall chart should draw a predicted cost segment');
+  assert.match(elements.costLegend.innerHTML, /Predicted cost/, 'legend should bifurcate predicted cost color');
 
   elements.costChart.querySelectorAll('.point')[1].dispatch('click');
   await flush();
@@ -162,8 +188,26 @@ async function flush() { await Promise.resolve(); await Promise.resolve(); await
   assert.strictEqual(elements.costChartTitle.textContent, 'Daily cost trend');
   assert.strictEqual(elements.costChartSubtitle.textContent, 'resource-a');
   assert.strictEqual(elements.overallBtn.classList.contains('hidden'), false);
-  assert.strictEqual(vm.runInContext('state.lastHealthPayload', context), null, 'resource selection must not auto-load health');
+  assert.strictEqual(vm.runInContext('state.lastHealthPayload.ResourceID', context), 'resource-a', 'resource selection should auto-load the PT6H resource health overview');
   assert.strictEqual(elements.resourceList.querySelectorAll('.resource-row').filter(r => r.classList.contains('active')).length, 1);
+  assert.match(elements.costChart.innerHTML, /predicted-cost-line/, 'resource chart should draw a predicted cost segment');
+
+  vm.runInContext(`renderHealthChart({health_kind:'azure', source:'Azure_Health_Analysis', series:[{MetricCategory:'Disk', MetricName:'UsedCapacity', Unit:'Bytes', Points:[{Timestamp:'2026-08-01T00:00:00Z', Value:1024}, {Timestamp:'2026-08-01T01:00:00Z', Value:2048}]}, {MetricCategory:'IOPs', MetricName:'Transactions', Unit:'Count', Points:[{Timestamp:'2026-08-01T00:00:00Z', Value:5}, {Timestamp:'2026-08-01T01:00:00Z', Value:9}]}, {MetricCategory:'Network', MetricName:'Network In', Unit:'Bytes', Points:[{Timestamp:'2026-08-01T00:00:00Z', Value:100}, {Timestamp:'2026-08-01T01:00:00Z', Value:200}]}], summary:{}})`, context);
+  assert.match(elements.healthChart.innerHTML, /<svg/, 'context-only Azure non-disk/non-IOPs numeric metrics should still draw a normalized health graph');
+  assert.match(elements.healthChart.innerHTML, /Azure context graph/, 'context-only Azure graph should explain normalized visibility without fabricating percentages');
+  assert.strictEqual(elements.healthChart.querySelectorAll('.point').length, 2, 'Azure Disk and IOPs metrics must not be plotted; only Network points should render');
+
+  const mongoPayload = {
+    health_kind: 'mongodb',
+    source: 'Mongo_Health_Analysis',
+    series: [{MetricCategory:'Connections', MetricName:'cluster_metrics.connections.current', Unit:'Count', Points:[{Timestamp:'2026-08-01T00:00:00Z', Value:42, Tier:'M40', SlowQueryCount:0, ScriptScheduleContext:{scheduled_scripts:[{script_name:'HourlyScript.py', scheduled_time:'Hourly', scheduled_slots:['00:00']}], note:'Supporting context only; no causality is inferred.'}}]}],
+    summary: {CostHealthCorrelation:'No Clear Correlation', OverallHealthStatus:'Healthy'}
+  };
+  vm.runInContext(`state.lastHealthPayload = ${JSON.stringify(mongoPayload)}; renderHealthChart(state.lastHealthPayload); renderHealthSummary(state.lastHealthPayload);`, context);
+  assert.match(vm.runInContext('scriptScheduleTooltip(state.lastHealthPayload.series[0].Points[0])', context), /HourlyScript\.py/, 'MongoDB health-point hover tooltip should include scheduled script names');
+  elements.healthChart.querySelectorAll('.point')[0].dispatch('click');
+  assert.match(elements.mongoPointKpis.innerHTML, /Scheduled Python Scripts/);
+  assert.match(elements.mongoPointKpis.innerHTML, /HourlyScript\.py/, 'MongoDB point KPI card should show scheduled script names after clicking a health point');
 
   elements.costChart.querySelectorAll('.point')[1].dispatch('click');
   await flush();

@@ -259,8 +259,26 @@ def metric_definitions(resource_id: str, token: str) -> list[dict[str, Any]]:
     return http_json('GET', url, headers={'Authorization': f'Bearer {token}'}, timeout=45).get('value', [])
 
 
+def azure_metric_preference(category: str, metric_name: str, unit: str | None) -> tuple[int, str]:
+    """Prefer percentage CPU/memory metrics so dashboard health charts can use a true % Y-axis."""
+    n = normalized_name(metric_name)
+    u = str(unit or '').lower()
+    score = 100
+    if category == 'CPU':
+        if 'percent' in n or 'percentage' in n or u == 'percent':
+            score = 0
+        elif 'time' in n or u in {'seconds', 'milliseconds'}:
+            score = 50
+    elif category == 'MemoryUsage':
+        if 'percent' in n or 'percentage' in n or u == 'percent':
+            score = 0
+        elif 'availablememory' in n or 'workingset' in n or 'usedmemory' in n or u in {'bytes', 'byte', 'megabytes', 'kilobytes'}:
+            score = 50
+    return score, n
+
+
 def choose_azure_metrics(defs: list[dict[str, Any]], per_category: int) -> dict[str, list[dict[str, str]]]:
-    chosen: dict[str, list[dict[str, str]]] = {category: [] for category in AZURE_CATEGORY_ORDER}
+    candidates: dict[str, list[dict[str, str]]] = {category: [] for category in AZURE_CATEGORY_ORDER}
     seen: set[str] = set()
     for item in defs:
         obj = item.get('name') or {}
@@ -268,10 +286,14 @@ def choose_azure_metrics(defs: list[dict[str, Any]], per_category: int) -> dict[
         if not isinstance(name, str) or name in seen:
             continue
         category = azure_category(name)
-        if not category or len(chosen[category]) >= per_category:
+        if not category:
             continue
         seen.add(name)
-        chosen[category].append({'MetricName': name, 'Unit': item.get('unit') or 'Unknown', 'PrimaryAggregation': item.get('primaryAggregationType') or 'Average'})
+        candidates[category].append({'MetricName': name, 'Unit': item.get('unit') or 'Unknown', 'PrimaryAggregation': item.get('primaryAggregationType') or 'Average'})
+    chosen: dict[str, list[dict[str, str]]] = {category: [] for category in AZURE_CATEGORY_ORDER}
+    for category, items in candidates.items():
+        items.sort(key=lambda item: azure_metric_preference(category, item.get('MetricName') or '', item.get('Unit')))
+        chosen[category] = items[:per_category]
     return chosen
 
 
@@ -284,14 +306,16 @@ def query_metric(
     preferred_aggregation: str | None = None,
     output_unit: str | None = None,
     value_scale: float = 1.0,
+    interval: str = 'PT1H',
+    aggregation_param: str = 'Average,Maximum,Total',
 ) -> tuple[list[dict[str, Any]], str | None]:
     end = (datetime.fromisoformat(to_date).replace(tzinfo=timezone.utc) + timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
     params = urlencode({
         'api-version': '2018-01-01',
         'timespan': f'{from_date}T00:00:00Z/{end}',
-        'interval': 'PT1H',
+        'interval': interval,
         'metricnames': metric_name,
-        'aggregation': 'Average,Maximum,Total',
+        'aggregation': aggregation_param,
     }, quote_via=quote)
     url = f'{MGMT}{resource_id}/providers/microsoft.insights/metrics?{params}'
     try:
@@ -321,6 +345,8 @@ def query_metric(
                     'Unit': output_unit or unit,
                     'MetricName': metric_name,
                     'Aggregation': aggregation,
+                    'Granularity': interval,
+                    'Interval': interval,
                 })
     out.sort(key=lambda p: p.get('Timestamp') or '')
     return out, None
@@ -369,11 +395,13 @@ def azure_resource_record(resource: dict[str, Any], token: str, from_date: str, 
         'RequestedFromDate': from_date,
         'RequestedToDate': to_date,
         'Metrics': {category: [] for category in AZURE_CATEGORY_ORDER},
+        'OverviewMetrics': {category: [] for category in AZURE_CATEGORY_ORDER},
         'MetricErrors': [],
     }
     if is_nat_gateway_id(rid):
         for category in NAT_GATEWAY_CATEGORY_ORDER:
             record['Metrics'][category] = []
+            record['OverviewMetrics'][category] = []
     try:
         defs = metric_definitions(rid, token)
     except Exception as e:
@@ -385,10 +413,24 @@ def azure_resource_record(resource: dict[str, Any], token: str, from_date: str, 
         for metric in chosen.get(category, []):
             points, err = query_metric(rid, metric['MetricName'], token, from_date, to_date)
             if err:
-                record['MetricErrors'].append({'MetricCategory': category, 'MetricName': metric['MetricName'], 'Error': err})
+                record['MetricErrors'].append({'MetricCategory': category, 'MetricName': metric['MetricName'], 'Granularity': 'PT1H', 'Aggregation': 'Average,Maximum,Total', 'Error': err})
+            else:
+                # If more than one metric maps to a category, keep all points but preserve source metric name.
+                record['Metrics'][category].extend(points)
+            overview_points, overview_err = query_metric(
+                rid,
+                metric['MetricName'],
+                token,
+                from_date,
+                to_date,
+                preferred_aggregation='Average',
+                interval='PT6H',
+                aggregation_param='Average',
+            )
+            if overview_err:
+                record['MetricErrors'].append({'MetricCategory': category, 'MetricName': metric['MetricName'], 'Granularity': 'PT6H', 'Aggregation': 'Average', 'Error': overview_err})
                 continue
-            # If more than one metric maps to a category, keep all points but preserve source metric name.
-            record['Metrics'][category].extend(points)
+            record['OverviewMetrics'][category].extend(overview_points)
     add_nat_gateway_cost_justification(record, rid, token, from_date, to_date)
     if not any(record['Metrics'].values()) and record['MetricErrors']:
         if any(is_azure_metric_retention_error(e.get('Error')) for e in record['MetricErrors']):
@@ -526,6 +568,7 @@ def generate(data_dir: Path, run_id: str, password: str, azure_workers: int, per
                     'RequestedFromDate': from_date,
                     'RequestedToDate': to_date,
                     'Metrics': {category: [] for category in (AZURE_CATEGORY_ORDER + (NAT_GATEWAY_CATEGORY_ORDER if is_nat_gateway_id(rid) else []))},
+                    'OverviewMetrics': {category: [] for category in (AZURE_CATEGORY_ORDER + (NAT_GATEWAY_CATEGORY_ORDER if is_nat_gateway_id(rid) else []))},
                     'MetricErrors': [{'Stage': 'subscription', 'Error': 'No Azure credential profile is configured for this resource subscription; Azure health lookup skipped.'}],
                 })
                 continue
@@ -556,6 +599,7 @@ def generate(data_dir: Path, run_id: str, password: str, azure_workers: int, per
                                 'RequestedFromDate': from_date,
                                 'RequestedToDate': to_date,
                                 'Metrics': {category: [] for category in AZURE_CATEGORY_ORDER},
+                                'OverviewMetrics': {category: [] for category in AZURE_CATEGORY_ORDER},
                                 'MetricErrors': [{'Stage': 'resource', 'Error': f'{type(e).__name__}: {e}'}],
                             })
             except Exception as e:
@@ -573,6 +617,7 @@ def generate(data_dir: Path, run_id: str, password: str, azure_workers: int, per
                         'RequestedFromDate': from_date,
                         'RequestedToDate': to_date,
                         'Metrics': {category: [] for category in AZURE_CATEGORY_ORDER},
+                        'OverviewMetrics': {category: [] for category in AZURE_CATEGORY_ORDER},
                         'MetricErrors': [{'Stage': 'auth', 'Error': profile_error}],
                     })
     azure_records.sort(key=lambda r: r.get('ResourceID') or '')
@@ -586,7 +631,13 @@ def generate(data_dir: Path, run_id: str, password: str, azure_workers: int, per
     azure_path = data_dir / f'Azure_Health_Analysis_{resolved}.json'
     mongo_path = data_dir / f'Mongo_Health_Analysis_{mongo_run_id_from_run_id(resolved)}.json'
     azure_path.write_text(json.dumps(azure_records, indent=2, default=str), encoding='utf-8')
-    mongo_path.write_text(json.dumps(mongo_records, indent=2, default=str), encoding='utf-8')
+    if not skip_mongo:
+        mongo_path.write_text(json.dumps(mongo_records, indent=2, default=str), encoding='utf-8')
+    elif mongo_path.exists():
+        existing_mongo = dashboard_api.read_json(mongo_path)
+        if isinstance(existing_mongo, list):
+            mongo_records = existing_mongo
+            mongo_meta = {'stored_snapshot_count_in_range': sum(len(v) for r in mongo_records for v in (r.get('Metrics') or {}).values() if isinstance(v, list))}
 
     summary_path = run['files'].get('summary')
     if summary_path and Path(summary_path).exists():
@@ -595,6 +646,7 @@ def generate(data_dir: Path, run_id: str, password: str, azure_workers: int, per
         data['mongo_health_analysis_file'] = str(mongo_path)
         data['azure_health_resource_count'] = len(azure_records)
         data['azure_health_resources_with_hourly_points'] = sum(1 for r in azure_records if any((r.get('Metrics') or {}).values()))
+        data['azure_health_resources_with_pt6h_overview_points'] = sum(1 for r in azure_records if any((r.get('OverviewMetrics') or {}).values()))
         data['azure_health_metric_error_count'] = sum(len(r.get('MetricErrors') or []) for r in azure_records)
         data['mongo_health_resource_count'] = len(mongo_records)
         data['mongo_health_resources_with_hourly_points'] = sum(1 for r in mongo_records if any((r.get('Metrics') or {}).values()))
@@ -609,6 +661,7 @@ def generate(data_dir: Path, run_id: str, password: str, azure_workers: int, per
         'azure_health_analysis_file': str(azure_path),
         'azure_resource_count': len(azure_records),
         'azure_resources_with_hourly_points': sum(1 for r in azure_records if any((r.get('Metrics') or {}).values())),
+        'azure_resources_with_pt6h_overview_points': sum(1 for r in azure_records if any((r.get('OverviewMetrics') or {}).values())),
         'azure_metric_error_count': sum(len(r.get('MetricErrors') or []) for r in azure_records),
         'azure_error': azure_error,
         'mongo_health_analysis_file': str(mongo_path),
