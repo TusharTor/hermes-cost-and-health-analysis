@@ -12,16 +12,21 @@ import mimetypes
 import os
 import re
 from collections import defaultdict
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 DEFAULT_DATA_DIR = Path(os.environ.get("COST_HEALTH_DATA_DIR", "/opt/data"))
-DEFAULT_CRONICLE_DB_PATH = Path(os.environ.get("CRONICLE_HISTORY_DB", "/opt/data/cronicle_history.sqlite3"))
-DEFAULT_CRONICLE_WINDOW_MINUTES = int(os.environ.get("CRONICLE_WINDOW_MINUTES", "30"))
-DEFAULT_CRONICLE_CPU_THRESHOLD = float(os.environ.get("CRONICLE_CPU_THRESHOLD", "50"))
-DEFAULT_CRONICLE_MAX_RESULTS = int(os.environ.get("CRONICLE_MAX_RESULTS", "10"))
+SCRIPT_SCHEDULE_FILES = {
+    "Platform_MongoDb": Path(os.environ.get("PLATFORM_MACHINEDATA_SCRIPTS", "/opt/data/Python-Scripts/platform_MACHINEDATA_python_scripts.txt")),
+    "Piaggio_MongoDb": Path(os.environ.get("PIAGGIO_MACHINEDATA_SCRIPTS", "/opt/data/Python-Scripts/Piaggio_MACHINEDATA_python_scripts.txt")),
+}
+MONGO_HEALTH_TO_COST_ID = {
+    "Cluster_Platform": "Platform_MongoDb",
+    "Cluster_Piaggio": "Piaggio_MongoDb",
+}
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 ROUTE_PREFIX = "/tor-ops-agent/dashboard"
@@ -39,6 +44,23 @@ class DashboardError(Exception):
 def run_id_from_path(path: str | Path) -> str | None:
     match = RUN_ID_RE.search(str(path))
     return match.group(1) if match else None
+
+
+def run_id_sort_key(run_id: str | None) -> tuple[int, str]:
+    """Chronological sort key for DDMMYY_HHMMSS run ids."""
+    if not run_id:
+        return (0, "")
+    try:
+        date_part, time_part = str(run_id).split("_", 1)
+        if len(date_part) == 6 and len(time_part) == 6:
+            dt = datetime.strptime(f"{date_part}_{time_part}", "%d%m%y_%H%M%S").replace(tzinfo=timezone.utc)
+            return (int(dt.timestamp()), str(run_id))
+        if len(date_part) == 8 and len(time_part) == 6:
+            dt = datetime.strptime(f"{date_part}_{time_part}", "%d%m%Y_%H%M%S").replace(tzinfo=timezone.utc)
+            return (int(dt.timestamp()), str(run_id))
+    except ValueError:
+        pass
+    return (0, str(run_id))
 
 
 def read_json(path: str | Path) -> Any:
@@ -166,7 +188,7 @@ def discover_runs(data_dir: str | Path = DEFAULT_DATA_DIR) -> list[dict[str, Any
             continue
     for run in _infer_runs_without_summary(data_dir):
         runs.setdefault(run["run_id"], run)
-    ordered = sorted(runs.values(), key=lambda r: r["run_id"], reverse=True)
+    ordered = sorted(runs.values(), key=lambda r: run_id_sort_key(r.get("run_id")), reverse=True)
     # Keep payload light for /api/runs; detailed summary is available separately.
     return ordered
 
@@ -378,30 +400,135 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
-def _cronicle_context_for_mongo_point(row: dict[str, Any], timestamp: str) -> dict[str, Any] | None:
-    """Return dashboard-safe Cronicle KPI context from SQLite only."""
-    if row.get("ResourceID") != "Platform_MongoDb" and row.get("MongoDBResourceID") != "Cluster_Platform":
-        return None
-    if not timestamp:
+def _parse_iso_utc(value: str | None) -> datetime | None:
+    if not value:
         return None
     try:
-        import cronicle_correlation
-        return cronicle_correlation.analyze_jobs_near_anomaly(
-            timestamp,
-            db_path=DEFAULT_CRONICLE_DB_PATH,
-            window_minutes=DEFAULT_CRONICLE_WINDOW_MINUTES,
-            cpu_threshold=DEFAULT_CRONICLE_CPU_THRESHOLD,
-            max_results=DEFAULT_CRONICLE_MAX_RESULTS,
-        )
-    except Exception as exc:
-        return {
-            "status": "CronicleAnalyzerUnavailable",
-            "timestamp": timestamp,
-            "window_minutes": DEFAULT_CRONICLE_WINDOW_MINUTES,
-            "cpu_threshold": DEFAULT_CRONICLE_CPU_THRESHOLD,
-            "jobs": [],
-            "note": f"Cronicle Analyzer could not read cronicle_history.sqlite3: {type(exc).__name__}.",
-        }
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _iso_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _script_schedule_resource_id(row: dict[str, Any] | None, resource_id: str | None = None) -> str | None:
+    rid = resource_id or (row or {}).get("ResourceID")
+    mongo_id = (row or {}).get("MongoDBResourceID")
+    if rid in SCRIPT_SCHEDULE_FILES:
+        return str(rid)
+    if mongo_id in MONGO_HEALTH_TO_COST_ID:
+        return MONGO_HEALTH_TO_COST_ID[str(mongo_id)]
+    return None
+
+
+def _load_script_schedule_map() -> dict[str, list[dict[str, Any]]]:
+    """Parse MachineData schedule text files into dashboard-safe records."""
+    parsed: dict[str, list[dict[str, Any]]] = {}
+    row_re = re.compile(r"\|\s*`([^`]+)`\s*\|\s*([^|]+?)\s*\|")
+    for resource_id, path in SCRIPT_SCHEDULE_FILES.items():
+        records: list[dict[str, Any]] = []
+        if not path.exists():
+            parsed[resource_id] = records
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            match = row_re.match(line)
+            if not match:
+                continue
+            script_name = match.group(1).strip()
+            scheduled_time = match.group(2).strip()
+            records.append({
+                "script_name": script_name,
+                "scheduled_time": scheduled_time,
+                "schedule_type": _schedule_type(scheduled_time),
+                "source_file": str(path),
+            })
+        parsed[resource_id] = records
+    return parsed
+
+
+def _schedule_type(label: str) -> str:
+    low = label.strip().lower()
+    if "30" in low and "minute" in low:
+        return "every_30_minutes"
+    if low.startswith("hourly"):
+        return "hourly"
+    if low.startswith("daily at"):
+        return "daily"
+    return "unknown"
+
+
+def _parse_daily_time(label: str) -> tuple[int, int] | None:
+    match = re.search(r"daily\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)", label.strip(), re.I)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    ampm = match.group(3).lower()
+    if ampm == "am" and hour == 12:
+        hour = 0
+    elif ampm == "pm" and hour != 12:
+        hour += 12
+    return hour, minute
+
+
+def _scheduled_scripts_for_hour(resource_id: str, timestamp: str) -> list[dict[str, Any]]:
+    ts = _parse_iso_utc(timestamp)
+    if not ts:
+        return []
+    hour = ts.hour
+    records = _load_script_schedule_map().get(resource_id, [])
+    scheduled: list[dict[str, Any]] = []
+    for rec in records:
+        label = str(rec.get("scheduled_time") or "")
+        typ = rec.get("schedule_type")
+        slots: list[str] = []
+        if typ == "hourly":
+            slots = [f"{hour:02d}:00"]
+        elif typ == "every_30_minutes":
+            slots = [f"{hour:02d}:00", f"{hour:02d}:30"]
+        elif typ == "daily":
+            parsed_time = _parse_daily_time(label)
+            if not parsed_time:
+                continue
+            sched_hour, sched_minute = parsed_time
+            if sched_hour != hour:
+                continue
+            slots = [f"{sched_hour:02d}:{sched_minute:02d}"]
+        else:
+            continue
+        scheduled.append({
+            "script_name": rec["script_name"],
+            "scheduled_time": label,
+            "scheduled_slots": slots,
+        })
+    return scheduled
+
+
+def script_schedule_context_for_mongo_point(row: dict[str, Any], timestamp: str) -> dict[str, Any] | None:
+    """Return configured script schedule context for a clicked MongoDB health hour."""
+    resource_id = _script_schedule_resource_id(row)
+    ts = _parse_iso_utc(timestamp)
+    if not resource_id or not ts:
+        return None
+    hour_start = ts.replace(minute=0, second=0, microsecond=0)
+    hour_end = hour_start + timedelta(hours=1)
+    scheduled = _scheduled_scripts_for_hour(resource_id, timestamp)
+    status = "Available" if scheduled else "NoScriptsScheduled"
+    return {
+        "resource_id": resource_id,
+        "timestamp": _iso_z(ts),
+        "hour_window_start": _iso_z(hour_start),
+        "hour_window_end": _iso_z(hour_end),
+        "schedule_timezone": "UTC dashboard health bucket",
+        "status": status,
+        "scheduled_scripts": scheduled,
+        "note": "MachineData scripts scheduled for the selected MongoDB health hour. Supporting context only; no causality is inferred.",
+    }
 
 
 def cost_timeseries(data_dir: str | Path = DEFAULT_DATA_DIR, run_id: str | None = None, resource_id: str | None = None) -> list[dict[str, Any]]:
@@ -438,14 +565,63 @@ def overall_cost_timeseries(data_dir: str | Path = DEFAULT_DATA_DIR, run_id: str
     return _merge_actual_and_predicted(actual, predicted)
 
 
+def _bucket_start_iso(timestamp: str, hours: int = 6) -> str | None:
+    try:
+        dt = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    dt = dt.replace(hour=(dt.hour // hours) * hours)
+    return dt.strftime("%Y-%m-%dT%H:00:00Z")
+
+
+def _six_hour_overview_points(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate MongoDB hourly health points to PT6H overview buckets."""
+    by_bucket: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for point in points:
+        bucket = _bucket_start_iso(str(point.get("Timestamp") or ""), 6)
+        if bucket:
+            by_bucket[bucket].append(point)
+    buckets = []
+    for bucket, bucket_points in sorted(by_bucket.items()):
+        numeric = [(p, _safe_float(p.get("Value"))) for p in bucket_points]
+        numeric = [(p, v) for p, v in numeric if v is not None]
+        if not numeric:
+            continue
+        values = [v for _, v in numeric]
+        max_point, max_value = max(numeric, key=lambda item: item[1])
+        min_point, min_value = min(numeric, key=lambda item: item[1])
+        avg_value = sum(values) / len(values)
+        compact = {
+            "Timestamp": bucket,
+            "Value": avg_value,
+            "BucketAverage": avg_value,
+            "BucketMax": max_value,
+            "BucketMin": min_value,
+            "BucketPointCount": len(values),
+            "PeakTimestamp": max_point.get("Timestamp"),
+            "Aggregation": "Average",
+            "Granularity": "PT6H",
+        }
+        for extra_key in ["Tier", "SlowQueryCount", "SlowQueryNamespaces", "MemoryTotalMB", "CpuCores", "MemoryResidentMB", "StorageSizeMB", "ScriptScheduleContext", "ScheduledScripts"]:
+            if extra_key in max_point:
+                compact[extra_key] = max_point.get(extra_key)
+        buckets.append(compact)
+    return buckets
+
+
 def _series_from_split_health_records(rows: list[dict[str, Any]], resource_id: str, date: str | None, source: str) -> list[dict[str, Any]]:
-    """Flatten Azure_Health_Analysis/Mongo_Health_Analysis resource records into dashboard series."""
+    """Flatten split health records; overview uses PT6H buckets, drilldown stays hourly."""
     output: list[dict[str, Any]] = []
     mongo_graph_categories = {"Connections", "MemoryUsage", "StorageSize"}
     for row in rows:
         if row.get("ResourceID") != resource_id:
             continue
         metrics = row.get("Metrics") or {}
+        if not date and source == "Azure_Health_Analysis":
+            metrics = row.get("OverviewMetrics") or {}
         if not isinstance(metrics, dict):
             continue
         row_is_mongo = source == "Mongo_Health_Analysis" or any(marker in str(row.get("HealthSource") or "") for marker in ["MongoDB", "MongoAtlas"])
@@ -465,29 +641,33 @@ def _series_from_split_health_records(rows: list[dict[str, Any]], resource_id: s
                 if value is None:
                     continue
                 compact_point = {"Timestamp": ts, "Value": value}
-                for extra_key in ["Tier", "SlowQueryCount", "SlowQueryNamespaces", "MemoryTotalMB", "CpuCores", "MemoryResidentMB", "StorageSizeMB"]:
+                for extra_key in ["Average", "Maximum", "Total", "Aggregation", "Granularity", "Interval", "Tier", "SlowQueryCount", "SlowQueryNamespaces", "MemoryTotalMB", "CpuCores", "MemoryResidentMB", "StorageSizeMB"]:
                     if extra_key in point:
                         compact_point[extra_key] = point.get(extra_key)
                 if row_is_mongo:
-                    cronicle_context = _cronicle_context_for_mongo_point(row, ts)
-                    if cronicle_context is not None:
-                        compact_point["CronicleContext"] = cronicle_context
-                        compact_point["CronicleJobs"] = cronicle_context.get("jobs", [])
+                    script_context = script_schedule_context_for_mongo_point(row, ts)
+                    if script_context is not None:
+                        compact_point["ScriptScheduleContext"] = script_context
+                        compact_point["ScheduledScripts"] = script_context.get("scheduled_scripts", [])
                 selected.append(compact_point)
             if not selected:
                 continue
             selected.sort(key=lambda p: p.get("Timestamp") or "")
+            plotted_points = selected if (date or source == "Azure_Health_Analysis") else _six_hour_overview_points(selected)
+            if not plotted_points:
+                continue
             first_source_point = next((p for p in points if isinstance(p, dict) and str(p.get("Timestamp") or "").startswith(date or "")), points[0] if points else {})
             output.append({
                 "ResourceID": resource_id,
                 "ResourceType": row.get("ResourceType"),
-                "Date": date or (selected[0]["Timestamp"][:10] if selected and selected[0].get("Timestamp") else None),
+                "Date": date or None,
                 "MetricCategory": str(category),
                 "MetricName": first_source_point.get("MetricName") or str(category),
                 "Unit": first_source_point.get("Unit") or "Unknown",
-                "Aggregation": first_source_point.get("Aggregation") or row.get("Aggregation") or "Hourly",
+                "Aggregation": "Average" if not date else first_source_point.get("Aggregation") or row.get("Aggregation") or "Hourly",
+                "Granularity": "PT6H" if not date else first_source_point.get("Granularity") or row.get("Granularity"),
                 "HealthSource": row.get("HealthSource") or source,
-                "Points": selected,
+                "Points": plotted_points,
             })
     preferred = ["CPU", "MemoryUsage", "Disk", "Network", "SNAT", "TrafficGiB", "AvgConn", "SNATPeak", "Connections", "StorageSize", "IOPs"]
     mongo_preferred = ["Connections", "MemoryUsage", "StorageSize"]
@@ -538,7 +718,7 @@ def _split_health_timeseries(run: dict[str, Any], resource_id: str, date: str | 
     return None
 
 
-def health_timeseries(data_dir: str | Path = DEFAULT_DATA_DIR, run_id: str | None = None, resource_id: str | None = None, date: str | None = None) -> dict[str, Any]:
+def health_timeseries(data_dir: str | Path = DEFAULT_DATA_DIR, run_id: str | None = None, resource_id: str | None = None, date: str | None = None, granularity: str | None = None) -> dict[str, Any]:
     if not resource_id:
         raise DashboardError(400, "resource_id is required")
     run = get_run(data_dir, run_id)
@@ -546,7 +726,7 @@ def health_timeseries(data_dir: str | Path = DEFAULT_DATA_DIR, run_id: str | Non
     summary = hmap.get(resource_id)
     split = _split_health_timeseries(run, resource_id, date)
     if split:
-        return {"source": split["source"], "health_kind": split["health_kind"], "run_id": run["run_id"], "ResourceID": resource_id, "date": date, "series": split["series"], "summary": summary, "message": split.get("message")}
+        return {"source": split["source"], "health_kind": split["health_kind"], "run_id": run["run_id"], "ResourceID": resource_id, "date": date, "granularity": granularity or ("PT1H" if date else "PT6H"), "series": split["series"], "summary": summary, "message": split.get("message")}
     ts_path = run["files"].get("health_timeseries")
     if ts_path and Path(ts_path).exists():
         all_series = read_json(ts_path)
@@ -556,6 +736,7 @@ def health_timeseries(data_dir: str | Path = DEFAULT_DATA_DIR, run_id: str | Non
                 "run_id": run["run_id"],
                 "ResourceID": resource_id,
                 "date": date,
+                "granularity": granularity or "PT6H",
                 "series": [],
                 "summary": summary,
                 "message": "Hourly health time-series generation produced 0 usable series for this run. Showing summary-only health status without fabricated graph points.",
@@ -571,12 +752,13 @@ def health_timeseries(data_dir: str | Path = DEFAULT_DATA_DIR, run_id: str | Non
                 if not any(str(p.get("Timestamp", "")).startswith(date) for p in points):
                     continue
             series.append(item)
-        return {"source": "Health-Timeseries", "run_id": run["run_id"], "ResourceID": resource_id, "date": date, "series": series, "summary": summary, "message": None if series else "Hourly file exists, but no series matched this resource/date."}
+        return {"source": "Health-Timeseries", "run_id": run["run_id"], "ResourceID": resource_id, "date": date, "granularity": granularity or "PT6H", "series": series, "summary": summary, "message": None if series else "Hourly file exists, but no series matched this resource/date."}
     return {
         "source": "Health-Analysis summary",
         "run_id": run["run_id"],
         "ResourceID": resource_id,
         "date": date,
+        "granularity": granularity or "PT6H",
         "series": [],
         "summary": summary,
         "message": "No hourly health time-series file is available for this run. Showing summary-only health status without fabricated graph points.",
@@ -601,7 +783,7 @@ def api_payload(path: str, query: dict[str, list[str]], data_dir: Path) -> Any:
     if path == "/api/cost":
         return cost_timeseries(data_dir, run_id, (query.get("resource_id") or [None])[0])
     if path == "/api/health":
-        return health_timeseries(data_dir, run_id, (query.get("resource_id") or [None])[0], (query.get("date") or [None])[0])
+        return health_timeseries(data_dir, run_id, (query.get("resource_id") or [None])[0], (query.get("date") or [None])[0], (query.get("granularity") or [None])[0])
     raise DashboardError(404, f"Unknown API path: {path}")
 
 

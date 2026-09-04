@@ -6,6 +6,8 @@ import json
 import hashlib
 import shutil
 import sys
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path('/opt/data/cost-health-dashboard')
@@ -13,7 +15,6 @@ PLUGIN = Path('/opt/data/plugins/cloudvitals/dashboard')
 DATA_DIR = Path('/opt/data')
 sys.path.insert(0, str(ROOT))
 import dashboard_api  # noqa: E402
-import cronicle_correlation  # noqa: E402
 
 
 def static_plugin_html(cache_bust: str | None = None) -> str:
@@ -27,12 +28,65 @@ def static_plugin_html(cache_bust: str | None = None) -> str:
 
 
 def compact_health_point(point: dict) -> dict:
-    """Keep plotted value plus MongoDB per-hour KPI metadata in health shards."""
+    """Keep plotted value plus per-point KPI metadata in health shards."""
     compact = {'Timestamp': point.get('Timestamp'), 'Value': point.get('Value')}
-    for key in ['Tier', 'SlowQueryCount', 'SlowQueryNamespaces', 'MemoryTotalMB', 'CpuCores', 'MemoryResidentMB', 'StorageSizeMB', 'CronicleContext', 'CronicleJobs']:
+    for key in ['Tier', 'SlowQueryCount', 'SlowQueryNamespaces', 'MemoryTotalMB', 'CpuCores', 'MemoryResidentMB', 'StorageSizeMB', 'ScriptScheduleContext', 'ScheduledScripts', 'DailyAverage', 'DailyMax', 'DailyMin', 'DailyPointCount', 'BucketAverage', 'BucketMax', 'BucketMin', 'BucketPointCount', 'PeakTimestamp', 'Granularity', 'Aggregation']:
         if key in point:
             compact[key] = point.get(key)
     return compact
+
+
+def _safe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bucket_start_iso(timestamp: str, hours: int = 6) -> str | None:
+    try:
+        dt = datetime.fromisoformat(str(timestamp).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    dt = dt.replace(hour=(dt.hour // hours) * hours)
+    return dt.strftime('%Y-%m-%dT%H:00:00Z')
+
+
+def _six_hour_overview_points(points: list[dict]) -> list[dict]:
+    by_bucket: dict[str, list[dict]] = defaultdict(list)
+    for point in points:
+        bucket = _bucket_start_iso(str(point.get('Timestamp') or ''), 6)
+        if bucket:
+            by_bucket[bucket].append(point)
+    output = []
+    for bucket, bucket_points in sorted(by_bucket.items()):
+        numeric = [(p, _safe_float(p.get('Value'))) for p in bucket_points]
+        numeric = [(p, v) for p, v in numeric if v is not None]
+        if not numeric:
+            continue
+        values = [v for _p, v in numeric]
+        max_point, max_value = max(numeric, key=lambda item: item[1])
+        min_point, min_value = min(numeric, key=lambda item: item[1])
+        avg_value = sum(values) / len(values)
+        compact = {
+            'Timestamp': bucket,
+            'Value': avg_value,
+            'BucketAverage': avg_value,
+            'BucketMax': max_value,
+            'BucketMin': min_value,
+            'BucketPointCount': len(values),
+            'PeakTimestamp': max_point.get('Timestamp'),
+            'Aggregation': 'Average',
+            'Granularity': 'PT6H',
+        }
+        for key in ['Tier', 'SlowQueryCount', 'SlowQueryNamespaces', 'MemoryTotalMB', 'CpuCores', 'MemoryResidentMB', 'StorageSizeMB', 'ScriptScheduleContext', 'ScheduledScripts']:
+            if key in max_point:
+                compact[key] = max_point.get(key)
+        output.append(compact)
+    return output
 
 
 def _group_split_health_series(rows: list[dict], source: str) -> dict[str, list[dict]]:
@@ -46,6 +100,7 @@ def _group_split_health_series(rows: list[dict], source: str) -> dict[str, list[
     for row in rows:
         rid = row.get('ResourceID')
         metrics = row.get('Metrics') or {}
+        overview_metrics = row.get('OverviewMetrics') or {}
         if not rid or not isinstance(metrics, dict):
             continue
         row_is_mongo = source == 'MongoDBCommandsOnly' or any(marker in str(row.get('HealthSource') or '') for marker in ['MongoDB', 'MongoAtlas'])
@@ -55,12 +110,14 @@ def _group_split_health_series(rows: list[dict], source: str) -> dict[str, list[
             by_day: dict[str, list[dict]] = {}
             if not isinstance(points, list):
                 continue
+            usable_points = []
             for point in points:
                 if not isinstance(point, dict) or point.get('Value') is None:
                     continue
                 ts = str(point.get('Timestamp') or '')
                 if len(ts) < 10:
                     continue
+                usable_points.append(point)
                 by_day.setdefault(ts[:10], []).append(point)
             for date, pts in by_day.items():
                 pts = sorted(pts, key=lambda p: p.get('Timestamp') or '')
@@ -73,6 +130,43 @@ def _group_split_health_series(rows: list[dict], source: str) -> dict[str, list[
                     'MetricName': first.get('MetricName') or str(category),
                     'Unit': first.get('Unit') or 'Unknown',
                     'Aggregation': first.get('Aggregation') or row.get('Aggregation') or 'Hourly',
+                    'HealthSource': row.get('HealthSource') or source,
+                    'Points': [compact_health_point(p) for p in pts],
+                })
+            if row_is_mongo and usable_points:
+                pts = sorted(usable_points, key=lambda p: p.get('Timestamp') or '')
+                first = pts[0]
+                grouped.setdefault(f"{rid}|", []).append({
+                    'ResourceID': rid,
+                    'ResourceType': row.get('ResourceType'),
+                    'Date': None,
+                    'MetricCategory': str(category),
+                    'MetricName': first.get('MetricName') or str(category),
+                    'Unit': first.get('Unit') or 'Unknown',
+                    'Aggregation': 'Average',
+                    'Granularity': 'PT6H',
+                    'HealthSource': row.get('HealthSource') or source,
+                    'Points': [compact_health_point(p) for p in _six_hour_overview_points(pts)],
+                })
+        if source == 'AzureMonitor' and isinstance(overview_metrics, dict):
+            # Resource overview must come from a second Azure Monitor call using
+            # interval=PT6H and aggregation=Average, not from client-side hourly rollups.
+            for category, points in overview_metrics.items():
+                if not isinstance(points, list):
+                    continue
+                pts = sorted([p for p in points if isinstance(p, dict) and p.get('Value') is not None and str(p.get('Timestamp') or '')], key=lambda p: p.get('Timestamp') or '')
+                if not pts:
+                    continue
+                first = pts[0]
+                grouped.setdefault(f"{rid}|", []).append({
+                    'ResourceID': rid,
+                    'ResourceType': row.get('ResourceType'),
+                    'Date': None,
+                    'MetricCategory': str(category),
+                    'MetricName': first.get('MetricName') or str(category),
+                    'Unit': first.get('Unit') or 'Unknown',
+                    'Aggregation': 'Average',
+                    'Granularity': 'PT6H',
                     'HealthSource': row.get('HealthSource') or source,
                     'Points': [compact_health_point(p) for p in pts],
                 })
@@ -94,7 +188,7 @@ def _health_kind_for_series(items: list[dict]) -> str:
         'Azure' in str(item.get('HealthSource') or '')
         or (
             not any(marker in str(item.get('HealthSource') or '') for marker in ['MongoDB', 'MongoAtlas'])
-            and item.get('MetricCategory') in {'CPU', 'MemoryUsage', 'Disk', 'Network', 'SNAT', 'TrafficGiB', 'AvgConn', 'SNATPeak'}
+            and item.get('MetricCategory') in {'CPU', 'MemoryUsage', 'Disk', 'IOPs', 'Network', 'SNAT', 'TrafficGiB', 'AvgConn', 'SNATPeak'}
         )
         for item in items
     )
@@ -171,16 +265,19 @@ def publish(run_id: str = 'latest') -> dict:
     if mongo_path and Path(mongo_path).exists():
         with open(mongo_path, encoding='utf-8') as fh:
             mongo_health_rows = json.load(fh)
-        # Cronicle dashboard KPI context is derived from cronicle_history.sqlite3
-        # at publish time. Existing embedded Cronicle fields are stripped and
-        # rebuilt by the Analyzer so the SQLite DB remains the source of truth.
-        mongo_health_rows, _cronicle_summary = cronicle_correlation.enrich_mongo_health_rows(
-            mongo_health_rows,
-            db_path=Path('/opt/data/cronicle_history.sqlite3'),
-            window_minutes=30,
-            cpu_threshold=50.0,
-            max_results=10,
-        )
+        for row in mongo_health_rows:
+            if not isinstance(row, dict):
+                continue
+            for points in (row.get('Metrics') or {}).values():
+                if not isinstance(points, list):
+                    continue
+                for point in points:
+                    if not isinstance(point, dict) or not point.get('Timestamp'):
+                        continue
+                    script_context = dashboard_api.script_schedule_context_for_mongo_point(row, str(point.get('Timestamp')))
+                    if script_context:
+                        point['ScriptScheduleContext'] = script_context
+                        point['ScheduledScripts'] = script_context.get('scheduled_scripts', [])
         for key, items in _group_split_health_series(mongo_health_rows, 'MongoDBCommandsOnly').items():
             health_series.setdefault(key, []).extend(items)
     ts_path = run['files'].get('health_timeseries')
