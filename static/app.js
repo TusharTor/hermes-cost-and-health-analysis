@@ -585,7 +585,7 @@ async function loadRun(runId, options = {}) {
 }
 
 function actualTotalCostForRun(runId, summary = {}) {
-  const summaryValue = summary.total_cost ?? summary.TotalCost ?? summary.totalCost ?? summary.actual_total_cost ?? summary.ActualTotalCost ?? summary.total_cost_amount ?? summary.TotalCostAmount;
+  const summaryValue = summary.prompt_range_total_cost ?? summary.PromptRangeTotalCost ?? summary.source_total_cost_amount ?? summary.SourceTotalCostAmount ?? summary.total_cost ?? summary.TotalCost ?? summary.totalCost ?? summary.actual_total_cost ?? summary.ActualTotalCost ?? summary.total_cost_amount ?? summary.TotalCostAmount;
   const parsedSummaryValue = numOrNull(summaryValue);
   if (parsedSummaryValue !== null) return parsedSummaryValue;
   const rows = state.overallCostByRun[runId] || [];

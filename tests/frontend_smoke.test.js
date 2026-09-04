@@ -112,7 +112,7 @@ function makeHarness() {
           {run_id: 'run2', fromDate: '2026-09-01', toDate: '2026-09-02', files: {}, has_health_timeseries: false}
         ],
         summaries: {
-          run1: {run_id: 'run1', fromDate: '2026-08-01', toDate: '2026-08-02', resource_count: 2, affected_resource_count: 2, cost_anomaly_records: 1, health_analysis_records: 1, health_records_with_unavailable_metrics: 0, health_timeseries_series_count: 1, has_health_timeseries: true},
+          run1: {run_id: 'run1', fromDate: '2026-08-01', toDate: '2026-08-02', resource_count: 2, affected_resource_count: 2, cost_anomaly_records: 1, health_analysis_records: 1, health_records_with_unavailable_metrics: 0, health_timeseries_series_count: 1, has_health_timeseries: true, prompt_range_total_cost: 999.99},
           run2: {run_id: 'run2', fromDate: '2026-09-01', toDate: '2026-09-02', resource_count: 1, affected_resource_count: 1, cost_anomaly_records: 0, health_analysis_records: 0, health_records_with_unavailable_metrics: 0, has_health_timeseries: false}
         },
         resources: {
@@ -169,7 +169,7 @@ async function flush() { await Promise.resolve(); await Promise.resolve(); await
   assert.match(elements.runMeta.innerHTML, /Date range/i, 'date range metadata should remain');
   assert.match(elements.runMeta.innerHTML, /Last loaded/i, 'last loaded metadata should remain');
   assert.match(elements.summaryCards.innerHTML, /Total cost/i, 'Affected summary card should be replaced by Total cost');
-  assert.match(elements.summaryCards.innerHTML, /425/, 'Total cost should sum actual aggregate CostAmount rows and exclude predicted points');
+  assert.match(elements.summaryCards.innerHTML, /999\.99/, 'Total cost should use prompt_range_total_cost from all source resource CostAmount in the requested fromDate/toDate range');
   assert.doesNotMatch(elements.summaryCards.innerHTML, /Affected|Cost anomalies/i, 'removed lower summary cards should not render');
   assert.strictEqual(elements.resourceList.querySelectorAll('.resource-row').filter(r => r.classList.contains('active')).length, 0);
   assert.strictEqual(elements.costChart.querySelectorAll('.point').length, 3, 'overall chart should render aggregate actual + predicted points');
